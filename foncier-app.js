@@ -1,724 +1,363 @@
-/* ============================================================
-   foncier-app.js - v0.3
-   Doctrine en cascade, transposee de computeVisibilityScore_V4.
-   Le moteur ne renvoie que la voie GAGNANTE (early-return), mais
-   chaque adaptateur ecrit son etat dans son cache pour que les
-   voyants s'allument independamment.
-   Ordre : vetos -> voie 1 (reglement, v1) -> voie 2 (comparables,
-   mesure du reel) -> voie 3 (zonage seul, modele) -> voie 4 (abstention).
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ce terrain se divise-t-il ?</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Bleu et blanc. Le bleu est franc et administratif, jamais violet. */
+    --encre:      #0A2342;   /* texte, navy profond */
+    --encre-doux: #5A6E8C;   /* texte secondaire */
+    --bleu:       #1B4DB1;   /* accent, actions */
+    --bleu-clair: #E9EFFA;   /* aplats */
+    --trait:      #CBD9EE;   /* filets, bordures : la ligne cadastrale */
+    --papier:     #FCFDFF;   /* fond */
+    --blanc:      #FFFFFF;
 
-   v0.2 : correction du veto qui avalait les zones AU.
-   v0.4 : discriminateur lotissement. Le proxy "vente de terrain a
-          batir" etait INVERSE sur les lots de lotissement : la
-          commercialisation d'un lotissement (= parcelles definitives)
-          etait lue comme un marche de la division actif. Deux
-          detecteurs independants, cf. section 3bis.
-   v0.3 : abandon de api.cquest.org (POC communautaire, http seul,
-          dispo non garantie) au profit du DVF geolocalise officiel
-          d'Etalab, en CSV statique par commune :
-          files.data.gouv.fr/geo-dvf/latest/csv/{annee}/communes/{dep}/{insee}.csv
-          Ajout du dedoublonnage par id_mutation (une vente genere
-          plusieurs lignes : Appartement + Dependance + ...).
-   ============================================================ */
+    /* Signaux fonctionnels : volontairement hors palette, ils doivent
+       trancher sur le bleu sans jamais s'y fondre. */
+    --ok:   #0F7B52;
+    --warn: #B45309;
+    --bad:  #B3261E;
+    --idle: #B9C6DA;
 
-/* ============================================================
-   1. CONFIG - LA SEULE SURFACE DE CALIBRATION
-   Tous les seuils ici, nulle part ailleurs.
-   ============================================================ */
-var CFG = {
-  // Passe-plat DVF (dvf-proxy.gs). files.data.gouv.fr n'envoie AUCUN
-  // en-tete CORS : le navigateur ne peut pas lire les CSV directement,
-  // quelle que soit l'origine. Colle ici ton URL /exec de deploiement GAS.
-  GAS_URL: 'https://script.google.com/macros/s/AKfycbzmai25INh-quLHyZPRKM-IfljSKLNm6sneWg4m0atQaXnf9-ld0srNr92p7M52Apnk/exec',
-
-  // Millesimes disponibles dans geo-dvf/latest. A bumper aux publications.
-  // NB : la liste fait foi cote GAS (var ANNEES), celle-ci n'est plus
-  // qu'un libelle pour les voyants.
-  ANNEES: [2021, 2022, 2023, 2024, 2025],
-
-  // Ensemble comparable
-  RAYON_M: 800,
-  SIM_MIN: 0.6,              // parcelle comparable : 0.6x a 1.6x la contenance
-  SIM_MAX: 1.6,
-  N_MIN_COMPARABLES: 15,     // sous ce seuil, la voie 2 ne tranche pas
-
-  // Seuils de taux (preuves ponderees / comparables)
-  TAUX_ELEVE: 0.15,
-  TAUX_PROBABLE: 0.05,
-  TAUX_FAIBLE: 0.01,
-
-  // Echantillon au-dela duquel l'absence de preuve devient un signal
-  N_ABSENCE_SIGNIFICATIVE: 40,
-
-  // Fraicheur des preuves (ans -> ponderation). Equivalent des 72h/48h de vizi.
-  FRAIS_ANS: 3,   POIDS_FRAIS: 1.0,
-  MOYEN_ANS: 6,   POIDS_MOYEN: 0.6,
-  POIDS_VIEUX: 0.3,
-  FENETRE_ANS: 10,
-
-  // --- Discriminateur lotissement ---
-  // Signal A (cadastre, independant de la date) : des lots de lotissement
-  // portent des numeros consecutifs dans la meme section, avec des
-  // contenances homogenes. Une division organique ne produit jamais ca.
-  LOT_RAYON_M: 250,          // fenetre cadastrale autour de la parcelle
-  LOT_ECART_NUM: 25,         // ecart max de numero pour etre "du meme paquet"
-  LOT_VOISINS_MIN: 8,        // en dessous, pas de presomption
-  // La bande de similarite est le coeur du detecteur : on ne demande pas
-  // "ce paquet est-il homogene ?" (deux lotissements voisins de tailles
-  // differentes le font echouer) mais "combien de parcelles RESSEMBLENT A
-  // LA MIENNE juste a cote ?". Teste sur Bernieres AH : sans la bande, le
-  // Camp de l'Ile (~670 m2) etait melange a l'operation voisine (~270 m2)
-  // -> dispersion 39 %. Avec la bande : 16 lots, dispersion 1 %.
-  LOT_SIM_MIN: 0.75,
-  LOT_SIM_MAX: 1.35,
-  LOT_CV_MAX: 0.25,          // dispersion residuelle DANS la bande
-
-  // Signal B (DVF) : plusieurs ventes de terrain a batir groupees dans le
-  // temps ET dans la meme section = commercialisation d'un lotissement.
-  // Ces mutations ne sont PAS des preuves de division : on les retire.
-  LOTDVF_N_MIN: 4,
-  LOTDVF_FENETRE_MOIS: 36,
-
-  // Vetos
-  MIN_CONTENANCE_M2: 400,
-  ZONES_VETO: ['A', 'N'],    // NB : AU est traite AVANT ce test, cf. moteur
-
-  // Coupe-circuit PLU : preuves anterieures a la derniere revision =
-  // temoignage sur des regles mortes. Equivalent du age_hours <= 72.
-  PONDERER_AVANT_REVISION: true,
-  POIDS_AVANT_REVISION: 0.0
-};
-
-/* Caches par voie : le moteur early-return, les voyants lisent ici. */
-var S_parcelleCache = null;
-var S_gpuCache = null;
-var S_risquesCache = null;
-var S_dvfCache = null;
-
-/* ============================================================
-   2. ADAPTATEURS
-   Regle d'or : un adaptateur ne jette jamais. Il renvoie
-   { status, data, note }. Une source morte allume un voyant
-   rouge, elle ne casse pas l'analyse.
-   ============================================================ */
-
-function jget(url) {
-  return fetch(url).then(function (r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  });
-}
-
-// --- BAN : adresse -> coordonnees. Source : api-adresse.data.gouv.fr
-function banAutocomplete(q) {
-  var u = 'https://api-adresse.data.gouv.fr/search/?q=' + encodeURIComponent(q) +
-          '&limit=5&autocomplete=1';
-  return jget(u).then(function (j) { return (j && j.features) || []; })
-                .catch(function () { return []; });
-}
-
-// --- Cadastre : point -> parcelle. Source : apicarto.ign.fr
-function fetchParcelle(lat, lon) {
-  var geom = encodeURIComponent(JSON.stringify({ type: 'Point', coordinates: [lon, lat] }));
-  return jget('https://apicarto.ign.fr/api/cadastre/parcelle?geom=' + geom)
-    .then(function (j) {
-      var f = j && j.features && j.features[0];
-      if (!f) return (S_parcelleCache = { status: 'no_data', note: 'aucune parcelle a ce point' });
-      var p = f.properties;
-      return (S_parcelleCache = {
-        status: 'ok',
-        data: {
-          idu: p.idu,
-          section: p.section,
-          numero: p.numero,
-          contenance: p.contenance,
-          insee: p.code_insee || ((p.code_dep || '') + (p.code_com || '')),
-          commune: p.nom_com,
-          geometry: f.geometry
-        }
-      });
-    })
-    .catch(function (e) { return (S_parcelleCache = { status: 'error', note: String(e.message) }); });
-}
-
-// --- Voisinage cadastral : toutes les parcelles autour du point.
-// Sert au detecteur de lotissement (signal A). Meme service que
-// fetchParcelle, mais avec un Polygon au lieu d'un Point.
-var S_voisinageCache = null;
-
-function fetchVoisinage(lat, lon) {
-  var r = CFG.LOT_RAYON_M;
-  var dLat = r / 111320;
-  var dLon = r / (111320 * Math.cos(lat * Math.PI / 180));
-  var poly = {
-    type: 'Polygon',
-    coordinates: [[
-      [lon - dLon, lat - dLat], [lon + dLon, lat - dLat],
-      [lon + dLon, lat + dLat], [lon - dLon, lat + dLat],
-      [lon - dLon, lat - dLat]
-    ]]
-  };
-  var geom = encodeURIComponent(JSON.stringify(poly));
-  return jget('https://apicarto.ign.fr/api/cadastre/parcelle?geom=' + geom + '&_limit=500')
-    .then(function (j) {
-      var f = (j && j.features) || [];
-      return (S_voisinageCache = {
-        status: f.length ? 'ok' : 'no_data',
-        data: f.map(function (x) {
-          return {
-            idu: x.properties.idu,
-            section: x.properties.section,
-            numero: x.properties.numero,
-            contenance: Number(x.properties.contenance || 0)
-          };
-        })
-      });
-    })
-    .catch(function (e) { return (S_voisinageCache = { status: 'error', note: String(e.message), data: [] }); });
-}
-
-// --- GPU : zonage PLU. Source : apicarto.ign.fr/api/gpu
-function fetchZonage(geometry) {
-  var geom = encodeURIComponent(JSON.stringify(geometry));
-  return jget('https://apicarto.ign.fr/api/gpu/zone-urba?geom=' + geom)
-    .then(function (j) {
-      var f = j && j.features && j.features[0];
-      if (!f) return (S_gpuCache = { status: 'no_data', note: 'commune non couverte par le GPU' });
-      var p = f.properties;
-      return (S_gpuCache = {
-        status: 'ok',
-        data: {
-          libelle: p.libelle,
-          libelong: p.libelong,
-          typezone: p.typezone,
-          datappro: p.datappro,     // AAAAMMJJ
-          partition: p.partition,   // DU_14066 -> cle d'acces au reglement via GPU
-          urlfic: p.urlfic          // souvent vide : NE PAS en deduire l'absence de reglement
-        }
-      });
-    })
-    .catch(function (e) { return (S_gpuCache = { status: 'error', note: String(e.message) }); });
-}
-
-// --- Reglement PLU via le GPU, a travers le passe-plat GAS.
-// L'API du GPU se declare "usage avant tout interne" dans sa propre spec :
-// pas de CORS garanti. La chaine est /document?partition= -> /details.
-// ATTENTION : ceci recupere le PDF, PAS les regles. La voie 1 exige de
-// structurer le texte (emprise au sol, reculs, facade sur voie) : c'est
-// le vrai chantier, et c'est ce que personne n'a fait a l'echelle.
-var S_pluCache = null;
-
-function fetchPLU(partition) {
-  if (!partition) {
-    return Promise.resolve((S_pluCache = { status: 'no_data', note: 'aucune partition dans le zonage' }));
-  }
-  if (!CFG.GAS_URL || CFG.GAS_URL.indexOf('COLLE_ICI') === 0) {
-    return Promise.resolve((S_pluCache = { status: 'error', note: 'CFG.GAS_URL non configure' }));
-  }
-  return jget(CFG.GAS_URL + '?action=plu&partition=' + encodeURIComponent(partition))
-    .then(function (j) { return (S_pluCache = j); })
-    .catch(function (e) { return (S_pluCache = { status: 'error', note: 'passe-plat injoignable : ' + e.message }); });
-}
-
-// --- Georisques. Source : georisques.gouv.fr/api/v1
-function fetchRisques(lat, lon) {
-  var u = 'https://georisques.gouv.fr/api/v1/resultats_rapport_risque?latlon=' + lon + ',' + lat;
-  return jget(u)
-    .then(function (j) { return (S_risquesCache = { status: 'ok', data: j }); })
-    .catch(function (e) { return (S_risquesCache = { status: 'error', note: String(e.message) }); });
-}
-
-/* ------------------------------------------------------------
-   DVF GEOLOCALISE OFFICIEL (Etalab / DGFiP) via passe-plat GAS
-   Le navigateur ne peut PAS lire files.data.gouv.fr : aucun en-tete
-   CORS n'est envoye, quelle que soit l'origine. dvf-proxy.gs telecharge
-   les millesimes, filtre le rayon, dedoublonne par id_mutation et
-   renvoie du JSON compact.
-   Colonnes verifiees sur donnees reelles : id_mutation, date_mutation,
-   nature_mutation, id_parcelle, type_local, code_nature_culture,
-   surface_terrain, longitude, latitude.
-   ------------------------------------------------------------ */
-
-function fetchDVF(insee, lat, lon) {
-  if (!CFG.GAS_URL || CFG.GAS_URL.indexOf('COLLE_ICI') === 0) {
-    return Promise.resolve(
-      (S_dvfCache = { status: 'error', note: 'CFG.GAS_URL non configure - voie 2 impossible', data: [] })
-    );
-  }
-  var u = CFG.GAS_URL + '?insee=' + encodeURIComponent(insee) +
-          '&lat=' + lat + '&lon=' + lon + '&dist=' + CFG.RAYON_M;
-  return jget(u)
-    .then(function (j) {
-      return (S_dvfCache = {
-        status: j.status || 'error',
-        data: j.data || [],
-        note: j.note || ''
-      });
-    })
-    .catch(function (e) {
-      return (S_dvfCache = { status: 'error', note: 'passe-plat injoignable : ' + e.message, data: [] });
-    });
-}
-
-/* ============================================================
-   3. HELPERS DE MESURE
-   ============================================================ */
-
-function anneeDe(dateStr) {
-  var y = parseInt(String(dateStr || '').slice(0, 4), 10);
-  return isFinite(y) ? y : null;
-}
-
-function poidsFraicheur(annee, anneeRevisionPLU) {
-  var age = new Date().getFullYear() - annee;
-  if (age > CFG.FENETRE_ANS || age < 0) return 0;
-  if (CFG.PONDERER_AVANT_REVISION && anneeRevisionPLU && annee < anneeRevisionPLU) {
-    return CFG.POIDS_AVANT_REVISION;   // regles mortes
-  }
-  if (age <= CFG.FRAIS_ANS) return CFG.POIDS_FRAIS;
-  if (age <= CFG.MOYEN_ANS) return CFG.POIDS_MOYEN;
-  return CFG.POIDS_VIEUX;
-}
-
-// Une mutation est-elle une PREUVE ? Deux signaux verifies sur donnees reelles :
-//   - nature_mutation = "Vente terrain a batir"
-//   - code_nature_culture = 'AB' (nature_culture = "terrains a batir")
-// Proxy ASSUME : marche du terrain a batir actif, pas "division aboutie"
-// (qui demanderait de suivre les id_parcelle dans le temps). Chantier v1.
-function estPreuve(m) {
-  var nat = String(m.nature_mutation || '').toLowerCase();
-  if (nat.indexOf('terrain à bâtir') >= 0 || nat.indexOf('terrain a batir') >= 0) return true;
-  if (String(m.code_nature_culture || '').toUpperCase() === 'AB') return true;
-  return false;
-}
-
-function construireComparables(dvf, contenance, anneeRevisionPLU, idsExclus) {
-  var lo = contenance * CFG.SIM_MIN, hi = contenance * CFG.SIM_MAX;
-  var exclus = {};
-  (idsExclus || []).forEach(function (id) { exclus[id] = 1; });
-  var n = 0, preuves = 0, poids = 0, retirees = 0, retenues = [];
-
-  dvf.forEach(function (m) {
-    var st = Number(m.surface_terrain || 0);
-    if (!st || st < lo || st > hi) return;
-    var an = anneeDe(m.date_mutation);
-    if (!an) return;
-    var w = poidsFraicheur(an, anneeRevisionPLU);
-    if (w === 0) return;
-    n++;
-    if (!estPreuve(m)) return;
-    if (exclus[m.id_mutation]) { retirees++; return; }   // lotissement : pas une preuve
-    preuves++; poids += w; retenues.push(m);
-  });
-
-  return { n: n, preuves: preuves, taux: n ? poids / n : 0, retirees: retirees, retenues: retenues };
-}
-
-/* ============================================================
-   3bis. DISCRIMINATEUR LOTISSEMENT
-   Pourquoi : "vente de terrain a batir" est un signal AMBIGU.
-   - division organique -> preuve que le secteur se divise
-   - commercialisation d'un lotissement -> preuve du CONTRAIRE :
-     ces parcelles sont des produits finis, dimensionnes pour rester
-     tels quels. Les compter comme preuves INVERSE le verdict.
-   Deux detecteurs independants, car ils couvrent des angles morts
-   differents : le signal DVF ne voit rien avant 2021, le signal
-   cadastral est intemporel.
-   ============================================================ */
-
-// id_parcelle CNIG : INSEE(5) + prefixe(3) + section(2) + numero(4)
-// "14066000AH0406" -> section "AH", numero 406
-function sectionDe(idu) { return String(idu || '').slice(8, 10); }
-function numeroDe(idu) { return parseInt(String(idu || '').slice(10, 14), 10); }
-
-function coefVariation(vals) {
-  if (vals.length < 2) return 999;
-  var moy = vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
-  if (!moy) return 999;
-  var v = vals.reduce(function (a, b) { return a + (b - moy) * (b - moy); }, 0) / vals.length;
-  return Math.sqrt(v) / moy;
-}
-
-/* --- SIGNAL A : le cadastre. Intemporel.
-   Un lotissement = numeros consecutifs, meme section, contenances
-   homogenes. Une division organique ne produit jamais ce motif.
-   Renvoie null (pas de presomption) ou un objet de constat. --- */
-function detecterLotissementCadastral(voisines, parcelle) {
-  if (!voisines || !voisines.length || !parcelle) return null;
-  var sec = parcelle.section;
-  var num = parseInt(parcelle.numero, 10);
-  var ref = Number(parcelle.contenance || 0);
-  if (!sec || !isFinite(num) || !ref) return null;
-
-  var lo = ref * CFG.LOT_SIM_MIN, hi = ref * CFG.LOT_SIM_MAX;
-
-  // Meme section + numero proche + contenance comparable A LA MIENNE.
-  // La bande de similarite evite de melanger deux operations mitoyennes.
-  var paquet = voisines.filter(function (v) {
-    var n = parseInt(v.numero, 10);
-    return v.section === sec && isFinite(n) &&
-           Math.abs(n - num) <= CFG.LOT_ECART_NUM &&
-           v.contenance >= lo && v.contenance <= hi;
-  });
-  if (paquet.length < CFG.LOT_VOISINS_MIN) return null;
-
-  var cs = paquet.map(function (v) { return v.contenance; });
-  var cv = coefVariation(cs);
-  if (cv > CFG.LOT_CV_MAX) return null;
-
-  var moy = cs.reduce(function (a, b) { return a + b; }, 0) / cs.length;
-  var nums = paquet.map(function (v) { return parseInt(v.numero, 10); }).sort(function (a, b) { return a - b; });
-  return {
-    n: paquet.length, cv: cv, moyenne: Math.round(moy), section: sec,
-    plage: nums[0] + '-' + nums[nums.length - 1]
-  };
-}
-
-/* --- SIGNAL B : DVF. Ne voit rien avant 2021, mais precis quand il voit.
-   Plusieurs ventes de terrain a batir groupees dans le temps ET dans la
-   meme section = commercialisation. On retire ces mutations des preuves. --- */
-function detecterLotissementsDVF(preuves) {
-  var parSection = {};
-  preuves.forEach(function (m) {
-    var sec = sectionDe(m.id_parcelle);
-    if (!sec) return;
-    (parSection[sec] = parSection[sec] || []).push(m);
-  });
-
-  var operations = [];
-  Object.keys(parSection).forEach(function (sec) {
-    var ms = parSection[sec];
-    if (ms.length < CFG.LOTDVF_N_MIN) return;
-    var ts = ms.map(function (m) { return new Date(m.date_mutation).getTime(); })
-               .filter(function (t) { return isFinite(t); }).sort();
-    if (ts.length < CFG.LOTDVF_N_MIN) return;
-    var moisEcoules = (ts[ts.length - 1] - ts[0]) / (1000 * 3600 * 24 * 30.44);
-    if (moisEcoules > CFG.LOTDVF_FENETRE_MOIS) return;   // etale : organique
-    operations.push({ section: sec, n: ms.length, mois: Math.round(moisEcoules), ids: ms.map(function (m) { return m.id_mutation; }) });
-  });
-  return operations;
-}
-
-/* ============================================================
-   4. LE MOTEUR
-   ============================================================ */
-function computeParcelPotential(ctx) {
-  var parcelle = ctx.parcelle, zonage = ctx.zonage, dvf = ctx.dvf || [];
-  var voisines = ctx.voisines || [];
-
-  // ----- VETOS : early-return, jamais un malus -----
-  if (!parcelle) {
-    return verdict('Exclu', 'aucune', 'nulle', 'Parcelle introuvable a cette adresse.');
+    --display: "Archivo", system-ui, sans-serif;
+    --texte:   "Instrument Sans", system-ui, sans-serif;
+    --mono:    "IBM Plex Mono", ui-monospace, Menlo, monospace;
   }
 
-  // AU se teste sur DEUX caracteres, AVANT le test A/N sur un seul.
-  // Sinon "AUc" -> charAt(0) = 'A' -> veto agricole a tort.
-  var tz = String((zonage && zonage.typezone) || '');
-  var estAU = tz.slice(0, 2).toUpperCase() === 'AU';
-
-  if (zonage && !estAU && CFG.ZONES_VETO.indexOf(tz.charAt(0).toUpperCase()) >= 0) {
-    return verdict('Exclu', 'veto', 'haute',
-      'Zone ' + (zonage.libelle || tz) + ' (' + tz + '). La division a des fins de construction ' +
-      'est exclue quel que soit le contexte de marche.');
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--papier);
+    color: var(--encre);
+    font-family: var(--texte);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
   }
-  if (parcelle.contenance < CFG.MIN_CONTENANCE_M2) {
-    return verdict('Exclu', 'veto', 'haute',
-      'Contenance de ' + parcelle.contenance + ' m2, sous le seuil de credibilite de ' +
-      CFG.MIN_CONTENANCE_M2 + ' m2.');
+  a { color: var(--bleu); }
+
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- ACCUEIL ---------- */
+  #view-search { position: relative; overflow: hidden; }
+  .hero { position: relative; padding: 110px 0 96px; }
+
+  /* SIGNATURE : extrait cadastral. Une voie, une serie de lots aux numeros
+     consecutifs, l'un surligne. C'est exactement le motif que le moteur
+     detecte : le decor dit ce que fait le produit. */
+  .plan {
+    position: absolute; top: -40px; right: -140px;
+    width: 620px; height: 520px;
+    pointer-events: none; user-select: none;
+    opacity: .5;
+    -webkit-mask-image: radial-gradient(120% 100% at 78% 34%, #000 34%, transparent 76%);
+            mask-image: radial-gradient(120% 100% at 78% 34%, #000 34%, transparent 76%);
   }
-
-  // ----- VOIE 1 : reglement PLU structure -----
-  // Non implementee en v0. Le PDF existe (zonage.urlfic) mais n'est pas
-  // machine-readable. Chantier v1, et seul actif non copiable.
-  // Fall-through explicite, comme le strangler de vizi.
-
-  // ----- DISCRIMINATEUR LOTISSEMENT -----
-  // Tourne AVANT la voie 2 : il conditionne la lecture des preuves.
-  // Le signal cadastral ne depend PAS de DVF : il doit pouvoir trancher
-  // meme sans une seule mutation. (Bug v0.5 : il etait enferme dans le
-  // bloc DVF et un lot repartait en "Probable" quand DVF etait vide.)
-  var lotCad = detecterLotissementCadastral(voisines, parcelle);
-  var preuvesBrutes = dvf.filter(estPreuve);
-  var opsDVF = detecterLotissementsDVF(preuvesBrutes);
-  var idsLot = [];
-  opsDVF.forEach(function (o) { idsLot = idsLot.concat(o.ids); });
-
-  var anneeRev = (zonage && zonage.datappro) ? anneeDe(zonage.datappro) : null;
-  var c = dvf.length ? construireComparables(dvf, parcelle.contenance, anneeRev, idsLot) : null;
-
-  var noteLot = '';
-  if (c && c.retirees > 0) {
-    noteLot = ' ' + c.retirees + ' vente(s) ecartee(s) : commercialisation de lotissement detectee (' +
-              opsDVF.map(function (o) { return o.n + ' lots section ' + o.section + ' en ' + o.mois + ' mois'; }).join(', ') +
-              '), ce n\'est pas un marche de la division.';
+  .plan .voie   { stroke: var(--trait); stroke-width: 7; fill: none; }
+  .plan .limite { stroke: var(--trait); stroke-width: 1.1; fill: none; }
+  .plan .lot    { fill: none; }
+  .plan .cible  { fill: var(--bleu); opacity: .10; }
+  .plan .cible-trait { stroke: var(--bleu); stroke-width: 1.8; fill: none; }
+  .plan text {
+    font-family: var(--mono); font-size: 9px; fill: var(--encre-doux);
+    opacity: .55; letter-spacing: .04em;
   }
+  .plan text.actif { fill: var(--bleu); opacity: 1; font-weight: 500; }
 
-  // Presomption forte : la parcelle est elle-meme un lot de lotissement.
-  // Independante de DVF. Ce n'est PAS un veto : depuis la loi ALUR, les
-  // regles d'urbanisme du lotissement deviennent caduques 10 ans apres
-  // l'autorisation de lotir (art. L442-9 c. urb.) quand la commune a un PLU.
-  // MAIS le cahier des charges, contractuel entre colotis, survit
-  // indefiniment et ne figure dans aucune base publique. D'ou : presomption
-  // + renvoi au notaire, jamais une certitude.
-  if (lotCad) {
-    return verdict('Faible', 'lotissement', 'moyenne',
-      'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles de taille comparable a ' +
-      'numeros consecutifs en section ' + lotCad.section + ' (' + lotCad.plage + '), moyenne ' +
-      lotCad.moyenne + ' m2, dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %. Un lot est un ' +
-      'produit fini, dimensionne pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : ' +
-      'le cahier des charges du lotissement peut interdire la division independamment du PLU, ' +
-      'et ne figure dans aucune base publique.');
+  .eyebrow {
+    position: relative; display: inline-flex; align-items: center; gap: 9px;
+    padding: 6px 14px 6px 10px; margin-bottom: 30px;
+    border: 1px solid var(--trait); border-radius: 999px;
+    background: var(--blanc);
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .02em;
+    color: var(--encre-doux);
+  }
+  .eyebrow b { color: var(--encre); font-weight: 500; }
+  .eyebrow .pastille {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: 0 0 7px;
   }
 
-  // ----- VOIE 2 : COMPARABLES (mesure du reel) -----
-  if (c && c.n >= CFG.N_MIN_COMPARABLES) {
-    // La confiance ne mesure plus SEULEMENT la taille de l'echantillon :
-    // un signal ambigu la plafonne. Une confiance haute sur un verdict
-    // potentiellement inverse est pire qu'une confiance faible sur un
-    // verdict juste.
-    var conf = c.n >= CFG.N_ABSENCE_SIGNIFICATIVE ? 'haute' : 'moyenne';
-    if (c.retirees > 0 && conf === 'haute') conf = 'moyenne';
+  #view-search h1 {
+    position: relative;
+    font-family: var(--display);
+    font-weight: 800;
+    font-size: clamp(38px, 7.2vw, 74px);
+    line-height: .96;
+    letter-spacing: -.035em;
+    margin: 0 0 22px;
+    max-width: 12ch;
+  }
+  #view-search h1 .fin { color: var(--encre-doux); }
 
-    var base = c.n + ' mutations comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
-               ' a ' + Math.round(parcelle.contenance * CFG.SIM_MAX) + ' m2) dans un rayon de ' +
-               CFG.RAYON_M + ' m. ' + c.preuves + ' vente(s) de terrain a batir, ' +
-               'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.' + noteLot;
+  .accroche {
+    position: relative;
+    font-size: 17.5px; color: var(--encre-doux);
+    max-width: 46ch; margin: 0 0 40px;
+  }
+  .accroche b { color: var(--encre); font-weight: 500; }
 
-    // Le cas qui vaut de l'or : gros echantillon, zero preuve.
-    // L'absence de signal EST un signal.
-    if (c.preuves === 0 && c.n >= CFG.N_ABSENCE_SIGNIFICATIVE) {
-      return verdict('Tres faible', 'comparables', conf,
-        base + ' Aucune operation sur un echantillon de cette taille : le marche de la division ' +
-        'est inexistant ici. Ce n\'est pas une lacune de donnee, c\'est un resultat.');
-    }
-    if (c.taux >= CFG.TAUX_ELEVE)    return verdict('Eleve', 'comparables', conf, base);
-    if (c.taux >= CFG.TAUX_PROBABLE) return verdict('Probable', 'comparables', conf, base);
-    if (c.taux >= CFG.TAUX_FAIBLE)   return verdict('Faible', 'comparables', conf, base);
-    return verdict('Tres faible', 'comparables', conf, base);
+  /* ---------- FORMULAIRE ---------- */
+  .form { position: relative; max-width: 560px; }
+  .form label {
+    display: block; font-family: var(--mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .09em;
+    color: var(--encre-doux); margin-bottom: 10px;
+  }
+  .champ { display: flex; gap: 10px; align-items: stretch; }
+  .ac-host { position: relative; flex: 1; }
+
+  input[type=text] {
+    width: 100%; padding: 15px 17px;
+    font-family: var(--texte); font-size: 16px; color: var(--encre);
+    background: var(--blanc);
+    border: 1.5px solid var(--trait); border-radius: 6px;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input[type=text]::placeholder { color: #9FB0C9; }
+  input[type=text]:focus {
+    outline: none; border-color: var(--bleu);
+    box-shadow: 0 0 0 4px rgba(27,77,177,.13);
   }
 
-  // ----- VOIE 3 : ZONAGE SEUL (modele, pas mesure) -----
-  if (tz) {
-    if (estAU) {
-      return verdict('Faible', 'zonage', 'faible',
-        'Zone a urbaniser (' + tz + '). L\'ouverture a l\'urbanisation est conditionnee ' +
-        '(OAP, equipements, modification du PLU) : hors de portee d\'une analyse automatique.');
-    }
-    if (tz.charAt(0).toUpperCase() === 'U') {
-      return verdict('Probable', 'zonage', 'faible',
-        'Zone ' + (zonage.libelle || tz) + ', constructible. Comparables insuffisants pour mesurer ' +
-        'le marche reel : verdict fonde sur le seul zonage, sans lecture du reglement. A confirmer.');
-    }
+  button {
+    font-family: var(--texte); font-size: 15px; font-weight: 600;
+    padding: 15px 26px; border: 1.5px solid transparent; border-radius: 6px;
+    background: var(--bleu); color: #fff; cursor: pointer; white-space: nowrap;
+    transition: background .15s, transform .06s;
+  }
+  button:hover:not(:disabled) { background: #163F94; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { background: var(--bleu-clair); color: #9FB0C9; cursor: default; }
+  button:focus-visible { outline: 3px solid rgba(27,77,177,.4); outline-offset: 2px; }
+  button.ghost {
+    background: var(--blanc); color: var(--bleu); border-color: var(--trait);
+  }
+  button.ghost:hover { background: var(--bleu-clair); border-color: var(--bleu); }
+
+  /* Autocompletion */
+  .ac-list {
+    position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 40;
+    background: var(--blanc); border: 1px solid var(--trait); border-radius: 6px;
+    box-shadow: 0 14px 34px -8px rgba(10,35,66,.15); overflow: hidden;
+  }
+  .ac-item {
+    padding: 11px 16px; font-size: 14.5px; cursor: pointer;
+    border-bottom: 1px solid var(--bleu-clair);
+  }
+  .ac-item:last-child { border-bottom: 0; }
+  .ac-item:hover { background: var(--bleu-clair); }
+
+  /* Ce que le moteur ne fait pas. La franchise est l'argument. */
+  .limites {
+    position: relative; margin-top: 44px; padding-top: 22px;
+    border-top: 1px solid var(--trait);
+    max-width: 560px;
+    font-size: 14px; color: var(--encre-doux);
+  }
+  .limites b { color: var(--encre); font-weight: 500; }
+
+  /* ---------- ANALYSE EN COURS ---------- */
+  #view-run { padding: 84px 0 96px; }
+  #view-run h1 {
+    font-family: var(--display); font-weight: 800; font-size: 34px;
+    letter-spacing: -.025em; margin: 0 0 6px;
+  }
+  #run-sub { font-family: var(--mono); font-size: 13px; color: var(--encre-doux); margin: 0 0 30px; }
+
+  /* Pas de carte flottante, pas d'ombre, pas d'angle arrondi : un extrait
+     cadastral n'en a pas. Un filet en tete, du papier, des hairlines. */
+  .card {
+    background: transparent; border: 0; border-radius: 0;
+    border-top: 1px solid var(--trait);
+    padding: 0;
   }
 
-  // ----- VOIE 4 : ABSTENTION -----
-  return verdict('Indetermine', 'aucune', 'nulle',
-    'Ni reglement structure, ni comparables en nombre suffisant, ni zonage exploitable. ' +
-    'Le moteur s\'abstient plutot que de deviner.');
-}
+  .step { display: flex; gap: 14px; padding: 15px 0; border-bottom: 1px solid var(--bleu-clair); }
+  .step:last-child { border-bottom: 0; }
+  .voyant {
+    width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; flex: 0 0 9px;
+    background: var(--idle);
+  }
+  .voyant.run  { background: var(--bleu); animation: pouls 1.1s ease-in-out infinite; }
+  .voyant.ok   { background: var(--ok); }
+  .voyant.warn { background: var(--warn); }
+  .voyant.bad  { background: var(--bad); }
+  @keyframes pouls { 50% { opacity: .25; transform: scale(.8); } }
 
-function verdict(valeur, voie, confiance, motif) {
-  return { valeur: valeur, voie: voie, confiance: confiance, motif: motif };
-}
+  .step-t { font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; }
+  .step-d {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+    color: var(--encre-doux); margin-top: 3px; word-break: break-word;
+  }
 
-/* ============================================================
-   5. UI - LA CASCADE
-   L'ecran d'etapes n'est PAS un chargement decoratif. C'est le
-   raisonnement qui se donne a voir. Une voie qui echoue s'affiche
-   en echec : le voyant rouge vaut plus cher que le vert.
-   ============================================================ */
-var UI = { steps: [], pluUrl: null, pluNom: null };
+  /* ---------- RAPPORT ---------- */
+  #view-report { padding: 84px 0 96px; }
+  #view-report h1 {
+    font-family: var(--display); font-weight: 800; font-size: 40px;
+    letter-spacing: -.03em; margin: 0 0 8px;
+  }
+  #view-report .sub {
+    font-family: var(--mono); font-size: 13.5px; color: var(--encre-doux);
+    margin: 0 0 32px; letter-spacing: .01em;
+  }
 
-function stepAdd(titre) {
-  var i = UI.steps.length;
-  UI.steps.push({ titre: titre, etat: 'run', detail: '' });
-  renderSteps();
-  return i;
-}
-function stepSet(i, etat, detail) {
-  UI.steps[i].etat = etat;
-  UI.steps[i].detail = detail || '';
-  renderSteps();
-}
-function stepsHtml() {
-  return UI.steps.map(function (s) {
-    return '<div class="step"><div class="voyant ' + s.etat + '"></div><div>' +
-           '<div class="step-t">' + s.titre + '</div>' +
-           (s.detail ? '<div class="step-d">' + s.detail + '</div>' : '') +
-           '</div></div>';
-  }).join('');
-}
-function renderSteps() {
-  document.getElementById('steps').innerHTML = stepsHtml();
-}
-function show(id) {
-  ['view-search', 'view-run', 'view-report'].forEach(function (v) {
-    document.getElementById(v).classList.toggle('hidden', v !== id);
-  });
-}
+  /* Le verdict N'EST PAS une carte a filet colore : c'est le composant
+     "alert" de tous les kits CSS, et un extrait cadastral n'y ressemble
+     en rien. Ici : un filet d'encre en tete, du papier, et la couleur
+     reduite a un CARRE DE LEGENDE - exactement comme sur la legende d'un
+     plan, ou une teinte pleine designe une categorie. */
+  .verdict {
+    --signal: var(--idle);
+    background: transparent; border: 0; border-radius: 0;
+    border-top: 2px solid var(--encre);
+    border-bottom: 1px solid var(--trait);
+    padding: 20px 0 26px; margin: 0 0 30px;
+  }
+  .verdict.tres-eleve, .verdict.eleve { --signal: var(--ok); }
+  .verdict.probable                   { --signal: var(--warn); }
+  .verdict.faible, .verdict.tres-faible, .verdict.exclu { --signal: var(--bad); }
+  .verdict.indetermine                { --signal: var(--idle); }
 
-/* ============================================================
-   6. ORCHESTRATION
-   ============================================================ */
-function analyser(feature) {
-  var lon = feature.geometry.coordinates[0];
-  var lat = feature.geometry.coordinates[1];
-  UI.steps = []; UI.pluUrl = null; UI.pluNom = null;
-  show('view-run');
-  document.getElementById('run-sub').textContent = feature.properties.label;
+  .verdict h3 {
+    margin: 0 0 14px; font-family: var(--mono); font-size: 11px; font-weight: 400;
+    text-transform: uppercase; letter-spacing: .09em; color: var(--encre-doux);
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .verdict .val {
+    display: flex; align-items: center; gap: 14px;
+    font-family: var(--display); font-weight: 800;
+    font-size: 44px; line-height: 1; letter-spacing: -.04em;
+    margin-bottom: 14px;
+  }
+  .verdict .val::before {
+    content: ''; flex: 0 0 14px; width: 14px; height: 14px;
+    background: var(--signal);   /* carre de legende : la seule couleur du bloc */
+  }
+  .verdict .why { font-size: 14.5px; line-height: 1.6; color: var(--encre-doux); max-width: 68ch; }
 
-  var s0 = stepAdd('Adresse résolue');
-  stepSet(s0, 'ok', lat.toFixed(5) + ', ' + lon.toFixed(5) + ' - source BAN');
+  .tag {
+    display: inline-block; font-family: var(--mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: .08em;
+    padding: 3px 7px; border: 1px solid var(--trait); border-radius: 2px;
+    color: var(--encre-doux); background: var(--blanc);
+  }
 
-  var s1 = stepAdd('Identification de la parcelle');
+  .actions { display: flex; gap: 10px; margin-top: 24px; }
 
-  fetchParcelle(lat, lon).then(function (pc) {
-    if (pc.status !== 'ok') {
-      stepSet(s1, 'bad', pc.note || 'echec cadastre');
-      return finir(null, null, [], []);
-    }
-    var p = pc.data;
-    stepSet(s1, 'ok', p.section + '-' + p.numero + ', ' + p.contenance + ' m2, ' +
-      p.commune + ' (' + p.insee + ')');
+  .hidden { display: none; }
 
-    var s2 = stepAdd('Zonage d\'urbanisme');
-    var s3 = stepAdd('Risques');
-    var s4 = stepAdd('Comparables de marché');
-    var s5 = stepAdd('Contexte parcellaire');
+  @media (max-width: 640px) {
+    .hero { padding: 64px 0 56px; }
+    .plan { display: none; }
+    .champ { flex-direction: column; }
+    #view-search h1 { max-width: none; }
+    .verdict .val { font-size: 32px; gap: 10px; }
+    .actions { flex-direction: column; }
+    button { width: 100%; }
+  }
 
-    return Promise.all([
-      fetchZonage(p.geometry).then(function (z) {
-        if (z.status !== 'ok') {
-          stepSet(s2, 'warn', z.note || 'commune non couverte par le GPU');
-          return z;
-        }
-        stepSet(s2, 'ok', z.data.typezone + ' - ' + (z.data.libelle || '') +
-          (z.data.datappro ? ' - PLU approuve ' + z.data.datappro : ''));
-        var s2b = stepAdd('Règlement PLU');
-        // La promesse DOIT etre retournee : sinon Promise.all n'attend pas,
-        // le rapport se dessine pendant que la requete est en vol et le
-        // voyant reste fige dans son etat initial. (Bug v0.6.)
-        return fetchPLU(z.data.partition).then(function (pl) {
-            var d = pl && pl.data;
-            if (pl && pl.status === 'ok' && d) {
-              var opposable = d.legalStatus === 'APPROVED';
-              stepSet(s2b, 'warn', d.type + ' ' + d.originalName + ' - ' +
-                (opposable ? 'opposable' : 'NON OPPOSABLE (' + d.legalStatus + ')') +
-                ' - reglement trouve : ' + d.reglement + ' - PDF non structure, voie 1 indisponible');
-              UI.pluUrl = d.reglementUrl;
-              UI.pluNom = d.reglement;
-            } else if (pl && pl.status === 'no_reglement') {
-              stepSet(s2b, 'bad', (pl.note || '') + ' - aucune piece nommee reglement');
-            } else if (pl && pl.status === 'no_files') {
-              stepSet(s2b, 'warn', (pl.note || '') + ' - seule l\'archive ZIP est disponible');
-              if (d && d.archiveUrl) { UI.pluUrl = d.archiveUrl; UI.pluNom = 'archive ZIP du ' + d.type; }
-            } else if (pl && d && d.rnu) {
-              stepSet(s2b, 'bad', 'commune au reglement national d\'urbanisme : pas de PLU');
-          } else {
-            stepSet(s2b, 'bad', (pl && pl.note) || 'reglement introuvable');
-          }
-          return z;
-        });
-      }),
-      fetchRisques(lat, lon).then(function (r) {
-        stepSet(s3, r.status === 'ok' ? 'ok' : 'warn',
-          r.status === 'ok' ? 'Georisques interroge' : (r.note || 'indisponible'));
-        return r;
-      }),
-      fetchDVF(p.insee, lat, lon).then(function (d) {
-        if (d.status === 'ok') {
-          stepSet(s4, 'ok', d.note + ' - DVF geolocalise Etalab ' +
-            CFG.ANNEES[0] + '-' + CFG.ANNEES[CFG.ANNEES.length - 1]);
-        } else {
-          stepSet(s4, 'bad', d.note || 'DVF indisponible - voie 2 impossible');
-        }
-        return d;
-      }),
-      fetchVoisinage(lat, lon).then(function (v) {
-        if (v.status === 'ok') {
-          var lot = detecterLotissementCadastral(v.data, p);
-          stepSet(s5, lot ? 'warn' : 'ok', v.data.length + ' parcelles dans ' + CFG.LOT_RAYON_M + ' m - ' +
-            (lot ? 'LOTISSEMENT PRESUME : ' + lot.n + ' lots section ' + lot.section + ' ' + lot.plage +
-                   ', moyenne ' + lot.moyenne + ' m2, dispersion ' + (lot.cv * 100).toFixed(0) + ' %'
-                 : 'tissu heterogene, pas de motif de lotissement'));
-        } else {
-          stepSet(s5, 'warn', v.note || 'voisinage cadastral indisponible - discriminateur aveugle');
-        }
-        return v;
-      })
-    ]).then(function (res) {
-      finir(p, res[0].status === 'ok' ? res[0].data : null,
-            (res[2] && res[2].data) || [], (res[3] && res[3].data) || []);
-    });
-  });
-}
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 
-function finir(parcelle, zonage, dvf, voisines) {
-  var v = computeParcelPotential({ parcelle: parcelle, zonage: zonage, dvf: dvf, voisines: voisines });
-  var s = stepAdd('Verdict');
-  stepSet(s, v.voie === 'aucune' ? 'warn' : 'ok',
-    'voie gagnante : ' + v.voie + ' - confiance ' + v.confiance);
-  setTimeout(function () { renderReport(parcelle, v); }, 500);
-}
+  @media print {
+    body { background: #fff; }
+    .no-print, .plan { display: none !important; }
+    .wrap { max-width: none; padding: 0; }
+    #view-report { padding: 0; }
+    .verdict { border-top: 2px solid #000; border-bottom: 1px solid #ccc; }
+    .card { border-top: 1px solid #ccc; }
+    a { color: inherit; text-decoration: none; }
+  }
+</style>
+</head>
+<body>
 
-function renderReport(parcelle, v) {
-  var cls = v.valeur.toLowerCase().replace(/\s+/g, '-');
-  document.getElementById('report').innerHTML =
-    '<h1>Étude foncière</h1>' +
-    '<p class="sub">' + (parcelle
-      ? parcelle.section + '-' + parcelle.numero + ' - ' + parcelle.contenance + ' m2 - ' + parcelle.commune
-      : 'Parcelle non identifiée') + '</p>' +
-    '<div class="verdict ' + cls + '">' +
-      '<h3>Potentiel de division parcellaire' +
-        '<span class="tag">voie ' + v.voie + '</span>' +
-        '<span class="tag">confiance ' + v.confiance + '</span></h3>' +
-      '<div class="val">' + v.valeur + '</div>' +
-      '<div class="why">' + v.motif + '</div>' +
-    '</div>' +
-    '<div class="card"><div class="step-t" style="margin-bottom:10px">Traçabilité</div>' +
-      stepsHtml() +
-      (UI.pluUrl
-        ? '<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">' +
-          '<div class="step-t">Pièce à vérifier</div>' +
-          '<div class="step-d" style="margin-top:4px">Reglement non lu par le moteur. ' +
-          '<a href="' + UI.pluUrl + '" target="_blank" rel="noopener">' + UI.pluNom + '</a></div></div>'
-        : '') +
-    '</div>';
-  show('view-report');
-}
+<div id="view-search">
+  <div class="wrap">
+    <div class="hero">
 
-/* ============================================================
-   7. BINDINGS
-   ============================================================ */
-(function () {
-  var input = document.getElementById('addr');
-  var ac = document.getElementById('ac');
-  var go = document.getElementById('go');
-  var choix = null, t = null;
+      <svg class="plan" viewBox="0 0 620 520" aria-hidden="true" focusable="false">
+        <path class="voie" d="M20 452 C 170 436, 330 424, 600 414" />
+        <g class="limite">
+          <path class="lot" d="M52 442 L60 250 L128 246 L124 438 Z" />
+          <path class="lot" d="M124 438 L128 246 L196 243 L194 435 Z" />
+          <path class="lot" d="M194 435 L196 243 L264 240 L264 432 Z" />
+          <path class="lot" d="M264 432 L264 240 L332 238 L334 429 Z" />
+          <path class="lot" d="M404 426 L406 235 L474 233 L478 424 Z" />
+          <path class="lot" d="M478 424 L474 233 L542 231 L548 421 Z" />
+          <path class="lot" d="M60 250 L548 231" />
+        </g>
+        <path class="cible"       d="M334 429 L332 238 L406 235 L404 426 Z" />
+        <path class="cible-trait" d="M334 429 L332 238 L406 235 L404 426 Z" />
+        <text x="78"  y="348">0402</text>
+        <text x="148" y="345">0403</text>
+        <text x="218" y="342">0404</text>
+        <text x="288" y="340">0405</text>
+        <text class="actif" x="352" y="337">0406</text>
+        <text x="426" y="334">0407</text>
+        <text x="500" y="331">0408</text>
+      </svg>
 
-  input.addEventListener('input', function () {
-    choix = null; go.disabled = true;
-    clearTimeout(t);
-    var q = input.value.trim();
-    if (q.length < 4) { ac.classList.add('hidden'); return; }
-    t = setTimeout(function () {
-      banAutocomplete(q).then(function (feats) {
-        if (!feats.length) { ac.classList.add('hidden'); return; }
-        ac.innerHTML = feats.map(function (f, i) {
-          return '<div class="ac-item" data-i="' + i + '">' + f.properties.label + '</div>';
-        }).join('');
-        ac.classList.remove('hidden');
-        Array.prototype.forEach.call(ac.children, function (el) {
-          el.onclick = function () {
-            choix = feats[+el.dataset.i];
-            input.value = choix.properties.label;
-            ac.classList.add('hidden');
-            go.disabled = false;
-          };
-        });
-      });
-    }, 180);
-  });
+      <div class="eyebrow">
+        <span class="pastille"></span>
+        <span><b>4 sources publiques</b> · cadastre, DVF, PLU, Géorisques</span>
+      </div>
 
-  go.onclick = function () { if (choix) analyser(choix); };
-})();
+      <h1>Ce terrain <span class="fin">se divise-t-il&nbsp;?</span></h1>
+
+      <p class="accroche">
+        Une adresse, et le moteur cherche des preuves dans le cadastre et les ventes réelles.
+        Il vous dit ce qu'il a trouvé, <b>et sur quoi il s'appuie pour le dire</b>.
+      </p>
+
+      <div class="form">
+        <label for="addr">Adresse du bien</label>
+        <div class="champ">
+          <div class="ac-host">
+            <input type="text" id="addr" autocomplete="off" spellcheck="false"
+                   placeholder="12 rue des Capucins, 61000 Alençon">
+            <div id="ac" class="ac-list hidden"></div>
+          </div>
+          <button id="go" disabled>Analyser</button>
+        </div>
+      </div>
+
+      <p class="limites">
+        <b>Ce qu'il ne fait pas.</b> Il ne lit pas le règlement du PLU : il vous donne le lien
+        vers la bonne page. Et quand les données ne suffisent pas à trancher, il le dit
+        au lieu de deviner.
+      </p>
+
+    </div>
+  </div>
+</div>
+
+<div id="view-run" class="hidden">
+  <div class="wrap">
+    <h1>Analyse en cours</h1>
+    <p id="run-sub"></p>
+    <div class="card" id="steps"></div>
+  </div>
+</div>
+
+<div id="view-report" class="hidden">
+  <div class="wrap">
+    <div id="report"></div>
+    <div class="actions no-print">
+      <button onclick="window.print()">Exporter l'étude</button>
+      <button class="ghost" onclick="location.reload()">Nouvelle analyse</button>
+    </div>
+  </div>
+</div>
+
+<script src="foncier-app.js"></script>
+</body>
+</html>
