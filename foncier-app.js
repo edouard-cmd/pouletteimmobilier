@@ -192,11 +192,32 @@ function fetchZonage(geometry) {
           libelong: p.libelong,
           typezone: p.typezone,
           datappro: p.datappro,     // AAAAMMJJ
-          urlfic: p.urlfic          // PDF du reglement : chantier voie 1
+          partition: p.partition,   // DU_14066 -> cle d'acces au reglement via GPU
+          urlfic: p.urlfic          // souvent vide : NE PAS en deduire l'absence de reglement
         }
       });
     })
     .catch(function (e) { return (S_gpuCache = { status: 'error', note: String(e.message) }); });
+}
+
+// --- Reglement PLU via le GPU, a travers le passe-plat GAS.
+// L'API du GPU se declare "usage avant tout interne" dans sa propre spec :
+// pas de CORS garanti. La chaine est /document?partition= -> /details.
+// ATTENTION : ceci recupere le PDF, PAS les regles. La voie 1 exige de
+// structurer le texte (emprise au sol, reculs, facade sur voie) : c'est
+// le vrai chantier, et c'est ce que personne n'a fait a l'echelle.
+var S_pluCache = null;
+
+function fetchPLU(partition) {
+  if (!partition) {
+    return Promise.resolve((S_pluCache = { status: 'no_data', note: 'aucune partition dans le zonage' }));
+  }
+  if (!CFG.GAS_URL || CFG.GAS_URL.indexOf('COLLE_ICI') === 0) {
+    return Promise.resolve((S_pluCache = { status: 'error', note: 'CFG.GAS_URL non configure' }));
+  }
+  return jget(CFG.GAS_URL + '?action=plu&partition=' + encodeURIComponent(partition))
+    .then(function (j) { return (S_pluCache = j); })
+    .catch(function (e) { return (S_pluCache = { status: 'error', note: 'passe-plat injoignable : ' + e.message }); });
 }
 
 // --- Georisques. Source : georisques.gouv.fr/api/v1
@@ -412,65 +433,68 @@ function computeParcelPotential(ctx) {
   // Fall-through explicite, comme le strangler de vizi.
 
   // ----- DISCRIMINATEUR LOTISSEMENT -----
-  // Doit tourner AVANT la voie 2 : il conditionne la lecture des preuves.
+  // Tourne AVANT la voie 2 : il conditionne la lecture des preuves.
+  // Le signal cadastral ne depend PAS de DVF : il doit pouvoir trancher
+  // meme sans une seule mutation. (Bug v0.5 : il etait enferme dans le
+  // bloc DVF et un lot repartait en "Probable" quand DVF etait vide.)
   var lotCad = detecterLotissementCadastral(voisines, parcelle);
   var preuvesBrutes = dvf.filter(estPreuve);
   var opsDVF = detecterLotissementsDVF(preuvesBrutes);
   var idsLot = [];
   opsDVF.forEach(function (o) { idsLot = idsLot.concat(o.ids); });
 
-  // ----- VOIE 2 : COMPARABLES (mesure du reel) -----
   var anneeRev = (zonage && zonage.datappro) ? anneeDe(zonage.datappro) : null;
-  if (dvf.length) {
-    var c = construireComparables(dvf, parcelle.contenance, anneeRev, idsLot);
-    if (c.n >= CFG.N_MIN_COMPARABLES) {
-      // La confiance ne mesure plus SEULEMENT la taille de l'echantillon.
-      // Un signal ambigu (lotissement presume) plafonne la confiance :
-      // une confiance haute sur un verdict potentiellement inverse est
-      // pire qu'une confiance faible sur un verdict juste.
-      var conf = c.n >= CFG.N_ABSENCE_SIGNIFICATIVE ? 'haute' : 'moyenne';
-      if (lotCad) conf = 'moyenne';
-      if (c.retirees > 0 && conf === 'haute') conf = 'moyenne';
+  var c = dvf.length ? construireComparables(dvf, parcelle.contenance, anneeRev, idsLot) : null;
 
-      var noteLot = '';
-      if (c.retirees > 0) {
-        noteLot += ' ' + c.retirees + ' vente(s) ecartee(s) : commercialisation de lotissement ' +
-                   'detectee (' + opsDVF.map(function (o) { return o.n + ' lots section ' + o.section + ' en ' + o.mois + ' mois'; }).join(', ') +
-                   '), ce n\'est pas un marche de la division.';
-      }
+  var noteLot = '';
+  if (c && c.retirees > 0) {
+    noteLot = ' ' + c.retirees + ' vente(s) ecartee(s) : commercialisation de lotissement detectee (' +
+              opsDVF.map(function (o) { return o.n + ' lots section ' + o.section + ' en ' + o.mois + ' mois'; }).join(', ') +
+              '), ce n\'est pas un marche de la division.';
+  }
 
-      // Presomption forte : la parcelle est elle-meme un lot de lotissement.
-      // Ce n'est PAS un veto : depuis la loi ALUR, les regles d'urbanisme du
-      // lotissement deviennent caduques 10 ans apres l'autorisation de lotir
-      // (art. L442-9 c. urb.) quand la commune a un PLU. MAIS le cahier des
-      // charges, contractuel entre colotis, survit indefiniment et ne figure
-      // dans aucune base publique. D'ou : presomption + renvoi au notaire.
-      if (lotCad) {
-        return verdict('Faible', 'lotissement', conf,
-          'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles de taille comparable a ' +
-          'numeros consecutifs en section ' + lotCad.section + ' (' + lotCad.plage + '), moyenne ' +
-          lotCad.moyenne + ' m2, dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %. Un lot est un ' +
-          'produit fini, dimensionne pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : le cahier des charges du ' +
-          'lotissement peut interdire la division independamment du PLU, et ne figure dans aucune ' +
-          'base publique.');
-      }
-      var base = c.n + ' mutations comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
-                 ' a ' + Math.round(parcelle.contenance * CFG.SIM_MAX) + ' m2) dans un rayon de ' +
-                 CFG.RAYON_M + ' m. ' + c.preuves + ' vente(s) de terrain a batir, ' +
-                 'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.' + noteLot;
+  // Presomption forte : la parcelle est elle-meme un lot de lotissement.
+  // Independante de DVF. Ce n'est PAS un veto : depuis la loi ALUR, les
+  // regles d'urbanisme du lotissement deviennent caduques 10 ans apres
+  // l'autorisation de lotir (art. L442-9 c. urb.) quand la commune a un PLU.
+  // MAIS le cahier des charges, contractuel entre colotis, survit
+  // indefiniment et ne figure dans aucune base publique. D'ou : presomption
+  // + renvoi au notaire, jamais une certitude.
+  if (lotCad) {
+    return verdict('Faible', 'lotissement', 'moyenne',
+      'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles de taille comparable a ' +
+      'numeros consecutifs en section ' + lotCad.section + ' (' + lotCad.plage + '), moyenne ' +
+      lotCad.moyenne + ' m2, dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %. Un lot est un ' +
+      'produit fini, dimensionne pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : ' +
+      'le cahier des charges du lotissement peut interdire la division independamment du PLU, ' +
+      'et ne figure dans aucune base publique.');
+  }
 
-      // Le cas qui vaut de l'or : gros echantillon, zero preuve.
-      // L'absence de signal EST un signal.
-      if (c.preuves === 0 && c.n >= CFG.N_ABSENCE_SIGNIFICATIVE) {
-        return verdict('Tres faible', 'comparables', 'haute',
-          base + ' Aucune operation sur un echantillon de cette taille : le marche de la division ' +
-          'est inexistant ici. Ce n\'est pas une lacune de donnee, c\'est un resultat.');
-      }
-      if (c.taux >= CFG.TAUX_ELEVE)    return verdict('Eleve', 'comparables', conf, base);
-      if (c.taux >= CFG.TAUX_PROBABLE) return verdict('Probable', 'comparables', conf, base);
-      if (c.taux >= CFG.TAUX_FAIBLE)   return verdict('Faible', 'comparables', conf, base);
-      return verdict('Tres faible', 'comparables', conf, base);
+  // ----- VOIE 2 : COMPARABLES (mesure du reel) -----
+  if (c && c.n >= CFG.N_MIN_COMPARABLES) {
+    // La confiance ne mesure plus SEULEMENT la taille de l'echantillon :
+    // un signal ambigu la plafonne. Une confiance haute sur un verdict
+    // potentiellement inverse est pire qu'une confiance faible sur un
+    // verdict juste.
+    var conf = c.n >= CFG.N_ABSENCE_SIGNIFICATIVE ? 'haute' : 'moyenne';
+    if (c.retirees > 0 && conf === 'haute') conf = 'moyenne';
+
+    var base = c.n + ' mutations comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
+               ' a ' + Math.round(parcelle.contenance * CFG.SIM_MAX) + ' m2) dans un rayon de ' +
+               CFG.RAYON_M + ' m. ' + c.preuves + ' vente(s) de terrain a batir, ' +
+               'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.' + noteLot;
+
+    // Le cas qui vaut de l'or : gros echantillon, zero preuve.
+    // L'absence de signal EST un signal.
+    if (c.preuves === 0 && c.n >= CFG.N_ABSENCE_SIGNIFICATIVE) {
+      return verdict('Tres faible', 'comparables', conf,
+        base + ' Aucune operation sur un echantillon de cette taille : le marche de la division ' +
+        'est inexistant ici. Ce n\'est pas une lacune de donnee, c\'est un resultat.');
     }
+    if (c.taux >= CFG.TAUX_ELEVE)    return verdict('Eleve', 'comparables', conf, base);
+    if (c.taux >= CFG.TAUX_PROBABLE) return verdict('Probable', 'comparables', conf, base);
+    if (c.taux >= CFG.TAUX_FAIBLE)   return verdict('Faible', 'comparables', conf, base);
+    return verdict('Tres faible', 'comparables', conf, base);
   }
 
   // ----- VOIE 3 : ZONAGE SEUL (modele, pas mesure) -----
@@ -503,7 +527,7 @@ function verdict(valeur, voie, confiance, motif) {
    raisonnement qui se donne a voir. Une voie qui echoue s'affiche
    en echec : le voyant rouge vaut plus cher que le vert.
    ============================================================ */
-var UI = { steps: [] };
+var UI = { steps: [], pluUrl: null, pluNom: null };
 
 function stepAdd(titre) {
   var i = UI.steps.length;
@@ -539,7 +563,7 @@ function show(id) {
 function analyser(feature) {
   var lon = feature.geometry.coordinates[0];
   var lat = feature.geometry.coordinates[1];
-  UI.steps = [];
+  UI.steps = []; UI.pluUrl = null; UI.pluNom = null;
   show('view-run');
   document.getElementById('run-sub').textContent = feature.properties.label;
 
@@ -568,9 +592,23 @@ function analyser(feature) {
           stepSet(s2, 'ok', z.data.typezone + ' - ' + (z.data.libelle || '') +
             (z.data.datappro ? ' - PLU approuve ' + z.data.datappro : ''));
           var s2b = stepAdd('Reglement PLU');
-          stepSet(s2b, 'warn', z.data.urlfic
-            ? 'PDF present, non structure - voie 1 indisponible'
-            : 'aucun reglement publie - voie 1 indisponible');
+          fetchPLU(z.data.partition).then(function (pl) {
+            var d = pl && pl.data;
+            if (pl && pl.status === 'ok' && d) {
+              var opposable = d.legalStatus === 'APPROVED';
+              stepSet(s2b, 'warn', d.type + ' ' + d.originalName + ' - ' +
+                (opposable ? 'opposable' : 'NON OPPOSABLE (' + d.legalStatus + ')') +
+                ' - reglement trouve : ' + d.reglement + ' - PDF non structure, voie 1 indisponible');
+              UI.pluUrl = d.reglementUrl;
+              UI.pluNom = d.reglement;
+            } else if (pl && pl.status === 'no_reglement') {
+              stepSet(s2b, 'bad', (pl.note || '') + ' - le document existe mais ne contient pas de reglement ecrit');
+            } else if (pl && d && d.rnu) {
+              stepSet(s2b, 'bad', 'commune au reglement national d\'urbanisme : pas de PLU');
+            } else {
+              stepSet(s2b, 'bad', (pl && pl.note) || 'reglement introuvable');
+            }
+          });
         } else {
           stepSet(s2, 'warn', z.note || 'commune non couverte par le GPU');
         }
@@ -633,6 +671,12 @@ function renderReport(parcelle, v) {
     '</div>' +
     '<div class="card"><div class="step-t" style="margin-bottom:10px">Tracabilite</div>' +
       stepsHtml() +
+      (UI.pluUrl
+        ? '<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">' +
+          '<div class="step-t">Piece a verifier</div>' +
+          '<div class="step-d" style="margin-top:4px">Reglement non lu par le moteur. ' +
+          '<a href="' + UI.pluUrl + '" target="_blank" rel="noopener">' + UI.pluNom + '</a></div></div>'
+        : '') +
     '</div>';
   show('view-report');
 }
