@@ -21,7 +21,14 @@
    Tous les seuils ici, nulle part ailleurs.
    ============================================================ */
 var CFG = {
+  // Passe-plat DVF (dvf-proxy.gs). files.data.gouv.fr n'envoie AUCUN
+  // en-tete CORS : le navigateur ne peut pas lire les CSV directement,
+  // quelle que soit l'origine. Colle ici ton URL /exec de deploiement GAS.
+  GAS_URL: 'COLLE_ICI_TON_URL_EXEC',
+
   // Millesimes disponibles dans geo-dvf/latest. A bumper aux publications.
+  // NB : la liste fait foi cote GAS (var ANNEES), celle-ci n'est plus
+  // qu'un libelle pour les voyants.
   ANNEES: [2021, 2022, 2023, 2024, 2025],
 
   // Ensemble comparable
@@ -137,110 +144,35 @@ function fetchRisques(lat, lon) {
 }
 
 /* ------------------------------------------------------------
-   DVF GEOLOCALISE OFFICIEL (Etalab / DGFiP)
-   Fichiers CSV statiques, un par commune et par millesime :
-   files.data.gouv.fr/geo-dvf/latest/csv/{annee}/communes/{dep}/{insee}.csv
-   Colonnes utiles verifiees sur donnees reelles :
-     id_mutation, date_mutation, nature_mutation, code_commune,
-     id_parcelle, code_type_local, type_local, code_nature_culture,
-     nature_culture, surface_terrain, longitude, latitude
-   ATTENTION : une mutation = PLUSIEURS lignes (un lot par ligne :
-   Appartement + Dependance...). Le dedoublonnage par id_mutation
-   est obligatoire, sinon on compte des lots au lieu de ventes.
+   DVF GEOLOCALISE OFFICIEL (Etalab / DGFiP) via passe-plat GAS
+   Le navigateur ne peut PAS lire files.data.gouv.fr : aucun en-tete
+   CORS n'est envoye, quelle que soit l'origine. dvf-proxy.gs telecharge
+   les millesimes, filtre le rayon, dedoublonne par id_mutation et
+   renvoie du JSON compact.
+   Colonnes verifiees sur donnees reelles : id_mutation, date_mutation,
+   nature_mutation, id_parcelle, type_local, code_nature_culture,
+   surface_terrain, longitude, latitude.
    ------------------------------------------------------------ */
 
-function depDeInsee(insee) {
-  var s = String(insee || '');
-  // DOM : 3 chiffres (971..976). Corse : 2A/2B sortent naturellement sur 2 car.
-  if (s.slice(0, 2) === '97' || s.slice(0, 2) === '98') return s.slice(0, 3);
-  return s.slice(0, 2);
-}
-
-function haversineM(lat1, lon1, lat2, lon2) {
-  var R = 6371000, rad = Math.PI / 180;
-  var dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
-  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-// Parseur CSV minimal mais correct : gere les champs quotes et les
-// virgules a l'interieur des quotes (les libelles de voie en contiennent).
-function parseCSV(txt) {
-  var lignes = [], champ = '', ligne = [], q = false;
-  for (var i = 0; i < txt.length; i++) {
-    var c = txt[i];
-    if (q) {
-      if (c === '"') { if (txt[i + 1] === '"') { champ += '"'; i++; } else q = false; }
-      else champ += c;
-    } else if (c === '"') q = true;
-    else if (c === ',') { ligne.push(champ); champ = ''; }
-    else if (c === '\n') { ligne.push(champ); lignes.push(ligne); ligne = []; champ = ''; }
-    else if (c !== '\r') champ += c;
-  }
-  if (champ.length || ligne.length) { ligne.push(champ); lignes.push(ligne); }
-  if (!lignes.length) return [];
-  var head = lignes.shift();
-  return lignes.filter(function (l) { return l.length > 1; }).map(function (l) {
-    var o = {};
-    for (var k = 0; k < head.length; k++) o[head[k]] = l[k];
-    return o;
-  });
-}
-
 function fetchDVF(insee, lat, lon) {
-  var dep = depDeInsee(insee);
-  var jobs = CFG.ANNEES.map(function (an) {
-    var u = 'https://files.data.gouv.fr/geo-dvf/latest/csv/' + an +
-            '/communes/' + dep + '/' + insee + '.csv';
-    return fetch(u)
-      .then(function (r) { return r.ok ? r.text() : ''; })
-      .then(function (t) { return t ? parseCSV(t) : []; })
-      .catch(function () { return []; });   // un millesime absent n'est pas une panne
-  });
-
-  return Promise.all(jobs).then(function (parts) {
-    var lignes = [].concat.apply([], parts);
-    if (!lignes.length) {
-      return (S_dvfCache = { status: 'error', note: 'aucun fichier DVF pour ' + insee, data: [] });
-    }
-
-    // 1. Filtre geographique, 2. dedoublonnage par id_mutation.
-    var parMutation = {};
-    lignes.forEach(function (l) {
-      var la = parseFloat(l.latitude), lo = parseFloat(l.longitude);
-      if (!isFinite(la) || !isFinite(lo)) return;
-      if (haversineM(lat, lon, la, lo) > CFG.RAYON_M) return;
-
-      var id = l.id_mutation;
-      var st = Number(l.surface_terrain || 0);
-      if (!parMutation[id]) {
-        parMutation[id] = {
-          id_mutation: id,
-          date_mutation: l.date_mutation,
-          nature_mutation: l.nature_mutation,
-          id_parcelle: l.id_parcelle,
-          surface_terrain: st,
-          type_local: l.type_local || '',
-          code_nature_culture: l.code_nature_culture || ''
-        };
-      } else {
-        var m = parMutation[id];
-        // On garde la surface de terrain la plus grande de la mutation,
-        // et on retient qu'il y a du bati des qu'une ligne en porte.
-        if (st > m.surface_terrain) m.surface_terrain = st;
-        if (l.type_local) m.type_local = l.type_local;
-        if (l.code_nature_culture) m.code_nature_culture = l.code_nature_culture;
-      }
+  if (!CFG.GAS_URL || CFG.GAS_URL.indexOf('COLLE_ICI') === 0) {
+    return Promise.resolve(
+      (S_dvfCache = { status: 'error', note: 'CFG.GAS_URL non configure - voie 2 impossible', data: [] })
+    );
+  }
+  var u = CFG.GAS_URL + '?insee=' + encodeURIComponent(insee) +
+          '&lat=' + lat + '&lon=' + lon + '&dist=' + CFG.RAYON_M;
+  return jget(u)
+    .then(function (j) {
+      return (S_dvfCache = {
+        status: j.status || 'error',
+        data: j.data || [],
+        note: j.note || ''
+      });
+    })
+    .catch(function (e) {
+      return (S_dvfCache = { status: 'error', note: 'passe-plat injoignable : ' + e.message, data: [] });
     });
-
-    var mutations = Object.keys(parMutation).map(function (k) { return parMutation[k]; });
-    return (S_dvfCache = {
-      status: mutations.length ? 'ok' : 'no_data',
-      data: mutations,
-      note: lignes.length + ' lignes brutes -> ' + mutations.length + ' mutations dans le rayon'
-    });
-  });
 }
 
 /* ============================================================
