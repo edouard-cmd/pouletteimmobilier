@@ -567,7 +567,7 @@ function analyser(feature) {
   show('view-run');
   document.getElementById('run-sub').textContent = feature.properties.label;
 
-  var s0 = stepAdd('Adresse resolue');
+  var s0 = stepAdd('Adresse résolue');
   stepSet(s0, 'ok', lat.toFixed(5) + ', ' + lon.toFixed(5) + ' - source BAN');
 
   var s1 = stepAdd('Identification de la parcelle');
@@ -583,7 +583,7 @@ function analyser(feature) {
 
     var s2 = stepAdd('Zonage d\'urbanisme');
     var s3 = stepAdd('Risques');
-    var s4 = stepAdd('Comparables de marche');
+    var s4 = stepAdd('Comparables de marché');
     var s5 = stepAdd('Contexte parcellaire');
 
     return Promise.all([
@@ -594,7 +594,7 @@ function analyser(feature) {
         }
         stepSet(s2, 'ok', z.data.typezone + ' - ' + (z.data.libelle || '') +
           (z.data.datappro ? ' - PLU approuve ' + z.data.datappro : ''));
-        var s2b = stepAdd('Reglement PLU');
+        var s2b = stepAdd('Règlement PLU');
         // La promesse DOIT etre retournee : sinon Promise.all n'attend pas,
         // le rapport se dessine pendant que la requete est en vol et le
         // voyant reste fige dans son etat initial. (Bug v0.6.)
@@ -664,10 +664,10 @@ function finir(parcelle, zonage, dvf, voisines) {
 function renderReport(parcelle, v) {
   var cls = v.valeur.toLowerCase().replace(/\s+/g, '-');
   document.getElementById('report').innerHTML =
-    '<h1>Etude fonciere</h1>' +
+    '<h1>Étude foncière</h1>' +
     '<p class="sub">' + (parcelle
       ? parcelle.section + '-' + parcelle.numero + ' - ' + parcelle.contenance + ' m2 - ' + parcelle.commune
-      : 'Parcelle non identifiee') + '</p>' +
+      : 'Parcelle non identifiée') + '</p>' +
     '<div class="verdict ' + cls + '">' +
       '<h3>Potentiel de division parcellaire' +
         '<span class="tag">voie ' + v.voie + '</span>' +
@@ -675,11 +675,11 @@ function renderReport(parcelle, v) {
       '<div class="val">' + v.valeur + '</div>' +
       '<div class="why">' + v.motif + '</div>' +
     '</div>' +
-    '<div class="card"><div class="step-t" style="margin-bottom:10px">Tracabilite</div>' +
+    '<div class="card"><div class="step-t" style="margin-bottom:10px">Traçabilité</div>' +
       stepsHtml() +
       (UI.pluUrl
         ? '<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">' +
-          '<div class="step-t">Piece a verifier</div>' +
+          '<div class="step-t">Pièce à vérifier</div>' +
           '<div class="step-d" style="margin-top:4px">Reglement non lu par le moteur. ' +
           '<a href="' + UI.pluUrl + '" target="_blank" rel="noopener">' + UI.pluNom + '</a></div></div>'
         : '') +
