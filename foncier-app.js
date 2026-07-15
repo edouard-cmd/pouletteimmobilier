@@ -24,7 +24,7 @@ var CFG = {
   // Passe-plat DVF (dvf-proxy.gs). files.data.gouv.fr n'envoie AUCUN
   // en-tete CORS : le navigateur ne peut pas lire les CSV directement,
   // quelle que soit l'origine. Colle ici ton URL /exec de deploiement GAS.
-  GAS_URL: 'COLLE_ICI_TON_URL_EXEC',
+  GAS_URL: 'https://script.google.com/macros/s/AKfycbzmai25INh-quLHyZPRKM-IfljSKLNm6sneWg4m0atQaXnf9-ld0srNr92p7M52Apnk/exec',
 
   // Millesimes disponibles dans geo-dvf/latest. A bumper aux publications.
   // NB : la liste fait foi cote GAS (var ANNEES), celle-ci n'est plus
