@@ -8,6 +8,11 @@
    mesure du reel) -> voie 3 (zonage seul, modele) -> voie 4 (abstention).
 
    v0.2 : correction du veto qui avalait les zones AU.
+   v0.4 : discriminateur lotissement. Le proxy "vente de terrain a
+          batir" etait INVERSE sur les lots de lotissement : la
+          commercialisation d'un lotissement (= parcelles definitives)
+          etait lue comme un marche de la division actif. Deux
+          detecteurs independants, cf. section 3bis.
    v0.3 : abandon de api.cquest.org (POC communautaire, http seul,
           dispo non garantie) au profit du DVF geolocalise officiel
           d'Etalab, en CSV statique par commune :
@@ -50,6 +55,21 @@ var CFG = {
   MOYEN_ANS: 6,   POIDS_MOYEN: 0.6,
   POIDS_VIEUX: 0.3,
   FENETRE_ANS: 10,
+
+  // --- Discriminateur lotissement ---
+  // Signal A (cadastre, independant de la date) : des lots de lotissement
+  // portent des numeros consecutifs dans la meme section, avec des
+  // contenances homogenes. Une division organique ne produit jamais ca.
+  LOT_RAYON_M: 250,          // fenetre cadastrale autour de la parcelle
+  LOT_ECART_NUM: 25,         // ecart max de numero pour etre "du meme paquet"
+  LOT_VOISINS_MIN: 8,        // en dessous, pas de presomption
+  LOT_CV_MAX: 0.45,          // coef. de variation des contenances (homogeneite)
+
+  // Signal B (DVF) : plusieurs ventes de terrain a batir groupees dans le
+  // temps ET dans la meme section = commercialisation d'un lotissement.
+  // Ces mutations ne sont PAS des preuves de division : on les retire.
+  LOTDVF_N_MIN: 4,
+  LOTDVF_FENETRE_MOIS: 36,
 
   // Vetos
   MIN_CONTENANCE_M2: 400,
@@ -111,6 +131,42 @@ function fetchParcelle(lat, lon) {
       });
     })
     .catch(function (e) { return (S_parcelleCache = { status: 'error', note: String(e.message) }); });
+}
+
+// --- Voisinage cadastral : toutes les parcelles autour du point.
+// Sert au detecteur de lotissement (signal A). Meme service que
+// fetchParcelle, mais avec un Polygon au lieu d'un Point.
+var S_voisinageCache = null;
+
+function fetchVoisinage(lat, lon) {
+  var r = CFG.LOT_RAYON_M;
+  var dLat = r / 111320;
+  var dLon = r / (111320 * Math.cos(lat * Math.PI / 180));
+  var poly = {
+    type: 'Polygon',
+    coordinates: [[
+      [lon - dLon, lat - dLat], [lon + dLon, lat - dLat],
+      [lon + dLon, lat + dLat], [lon - dLon, lat + dLat],
+      [lon - dLon, lat - dLat]
+    ]]
+  };
+  var geom = encodeURIComponent(JSON.stringify(poly));
+  return jget('https://apicarto.ign.fr/api/cadastre/parcelle?geom=' + geom + '&_limit=500')
+    .then(function (j) {
+      var f = (j && j.features) || [];
+      return (S_voisinageCache = {
+        status: f.length ? 'ok' : 'no_data',
+        data: f.map(function (x) {
+          return {
+            idu: x.properties.idu,
+            section: x.properties.section,
+            numero: x.properties.numero,
+            contenance: Number(x.properties.contenance || 0)
+          };
+        })
+      });
+    })
+    .catch(function (e) { return (S_voisinageCache = { status: 'error', note: String(e.message), data: [] }); });
 }
 
 // --- GPU : zonage PLU. Source : apicarto.ign.fr/api/gpu
@@ -207,9 +263,11 @@ function estPreuve(m) {
   return false;
 }
 
-function construireComparables(dvf, contenance, anneeRevisionPLU) {
+function construireComparables(dvf, contenance, anneeRevisionPLU, idsExclus) {
   var lo = contenance * CFG.SIM_MIN, hi = contenance * CFG.SIM_MAX;
-  var n = 0, preuves = 0, poids = 0;
+  var exclus = {};
+  (idsExclus || []).forEach(function (id) { exclus[id] = 1; });
+  var n = 0, preuves = 0, poids = 0, retirees = 0, retenues = [];
 
   dvf.forEach(function (m) {
     var st = Number(m.surface_terrain || 0);
@@ -219,10 +277,88 @@ function construireComparables(dvf, contenance, anneeRevisionPLU) {
     var w = poidsFraicheur(an, anneeRevisionPLU);
     if (w === 0) return;
     n++;
-    if (estPreuve(m)) { preuves++; poids += w; }
+    if (!estPreuve(m)) return;
+    if (exclus[m.id_mutation]) { retirees++; return; }   // lotissement : pas une preuve
+    preuves++; poids += w; retenues.push(m);
   });
 
-  return { n: n, preuves: preuves, taux: n ? poids / n : 0 };
+  return { n: n, preuves: preuves, taux: n ? poids / n : 0, retirees: retirees, retenues: retenues };
+}
+
+/* ============================================================
+   3bis. DISCRIMINATEUR LOTISSEMENT
+   Pourquoi : "vente de terrain a batir" est un signal AMBIGU.
+   - division organique -> preuve que le secteur se divise
+   - commercialisation d'un lotissement -> preuve du CONTRAIRE :
+     ces parcelles sont des produits finis, dimensionnes pour rester
+     tels quels. Les compter comme preuves INVERSE le verdict.
+   Deux detecteurs independants, car ils couvrent des angles morts
+   differents : le signal DVF ne voit rien avant 2021, le signal
+   cadastral est intemporel.
+   ============================================================ */
+
+// id_parcelle CNIG : INSEE(5) + prefixe(3) + section(2) + numero(4)
+// "14066000AH0406" -> section "AH", numero 406
+function sectionDe(idu) { return String(idu || '').slice(8, 10); }
+function numeroDe(idu) { return parseInt(String(idu || '').slice(10, 14), 10); }
+
+function coefVariation(vals) {
+  if (vals.length < 2) return 999;
+  var moy = vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+  if (!moy) return 999;
+  var v = vals.reduce(function (a, b) { return a + (b - moy) * (b - moy); }, 0) / vals.length;
+  return Math.sqrt(v) / moy;
+}
+
+/* --- SIGNAL A : le cadastre. Intemporel.
+   Un lotissement = numeros consecutifs, meme section, contenances
+   homogenes. Une division organique ne produit jamais ce motif.
+   Renvoie null (pas de presomption) ou un objet de constat. --- */
+function detecterLotissementCadastral(voisines, parcelle) {
+  if (!voisines || !voisines.length || !parcelle) return null;
+  var sec = parcelle.section;
+  var num = parseInt(parcelle.numero, 10);
+  if (!sec || !isFinite(num)) return null;
+
+  var paquet = voisines.filter(function (v) {
+    var n = parseInt(v.numero, 10);
+    return v.section === sec && isFinite(n) && Math.abs(n - num) <= CFG.LOT_ECART_NUM;
+  });
+  if (paquet.length < CFG.LOT_VOISINS_MIN) return null;
+
+  var cs = paquet.map(function (v) { return v.contenance; }).filter(function (c) { return c > 0; });
+  if (cs.length < CFG.LOT_VOISINS_MIN) return null;
+
+  var cv = coefVariation(cs);
+  if (cv > CFG.LOT_CV_MAX) return null;   // trop heterogene : tissu ancien, pas un lotissement
+
+  var moy = cs.reduce(function (a, b) { return a + b; }, 0) / cs.length;
+  return { n: paquet.length, cv: cv, moyenne: Math.round(moy), section: sec };
+}
+
+/* --- SIGNAL B : DVF. Ne voit rien avant 2021, mais precis quand il voit.
+   Plusieurs ventes de terrain a batir groupees dans le temps ET dans la
+   meme section = commercialisation. On retire ces mutations des preuves. --- */
+function detecterLotissementsDVF(preuves) {
+  var parSection = {};
+  preuves.forEach(function (m) {
+    var sec = sectionDe(m.id_parcelle);
+    if (!sec) return;
+    (parSection[sec] = parSection[sec] || []).push(m);
+  });
+
+  var operations = [];
+  Object.keys(parSection).forEach(function (sec) {
+    var ms = parSection[sec];
+    if (ms.length < CFG.LOTDVF_N_MIN) return;
+    var ts = ms.map(function (m) { return new Date(m.date_mutation).getTime(); })
+               .filter(function (t) { return isFinite(t); }).sort();
+    if (ts.length < CFG.LOTDVF_N_MIN) return;
+    var moisEcoules = (ts[ts.length - 1] - ts[0]) / (1000 * 3600 * 24 * 30.44);
+    if (moisEcoules > CFG.LOTDVF_FENETRE_MOIS) return;   // etale : organique
+    operations.push({ section: sec, n: ms.length, mois: Math.round(moisEcoules), ids: ms.map(function (m) { return m.id_mutation; }) });
+  });
+  return operations;
 }
 
 /* ============================================================
@@ -230,6 +366,7 @@ function construireComparables(dvf, contenance, anneeRevisionPLU) {
    ============================================================ */
 function computeParcelPotential(ctx) {
   var parcelle = ctx.parcelle, zonage = ctx.zonage, dvf = ctx.dvf || [];
+  var voisines = ctx.voisines || [];
 
   // ----- VETOS : early-return, jamais un malus -----
   if (!parcelle) {
@@ -257,16 +394,53 @@ function computeParcelPotential(ctx) {
   // machine-readable. Chantier v1, et seul actif non copiable.
   // Fall-through explicite, comme le strangler de vizi.
 
+  // ----- DISCRIMINATEUR LOTISSEMENT -----
+  // Doit tourner AVANT la voie 2 : il conditionne la lecture des preuves.
+  var lotCad = detecterLotissementCadastral(voisines, parcelle);
+  var preuvesBrutes = dvf.filter(estPreuve);
+  var opsDVF = detecterLotissementsDVF(preuvesBrutes);
+  var idsLot = [];
+  opsDVF.forEach(function (o) { idsLot = idsLot.concat(o.ids); });
+
   // ----- VOIE 2 : COMPARABLES (mesure du reel) -----
   var anneeRev = (zonage && zonage.datappro) ? anneeDe(zonage.datappro) : null;
   if (dvf.length) {
-    var c = construireComparables(dvf, parcelle.contenance, anneeRev);
+    var c = construireComparables(dvf, parcelle.contenance, anneeRev, idsLot);
     if (c.n >= CFG.N_MIN_COMPARABLES) {
+      // La confiance ne mesure plus SEULEMENT la taille de l'echantillon.
+      // Un signal ambigu (lotissement presume) plafonne la confiance :
+      // une confiance haute sur un verdict potentiellement inverse est
+      // pire qu'une confiance faible sur un verdict juste.
       var conf = c.n >= CFG.N_ABSENCE_SIGNIFICATIVE ? 'haute' : 'moyenne';
+      if (lotCad) conf = 'moyenne';
+      if (c.retirees > 0 && conf === 'haute') conf = 'moyenne';
+
+      var noteLot = '';
+      if (c.retirees > 0) {
+        noteLot += ' ' + c.retirees + ' vente(s) ecartee(s) : commercialisation de lotissement ' +
+                   'detectee (' + opsDVF.map(function (o) { return o.n + ' lots section ' + o.section + ' en ' + o.mois + ' mois'; }).join(', ') +
+                   '), ce n\'est pas un marche de la division.';
+      }
+
+      // Presomption forte : la parcelle est elle-meme un lot de lotissement.
+      // Ce n'est PAS un veto : depuis la loi ALUR, les regles d'urbanisme du
+      // lotissement deviennent caduques 10 ans apres l'autorisation de lotir
+      // (art. L442-9 c. urb.) quand la commune a un PLU. MAIS le cahier des
+      // charges, contractuel entre colotis, survit indefiniment et ne figure
+      // dans aucune base publique. D'ou : presomption + renvoi au notaire.
+      if (lotCad) {
+        return verdict('Faible', 'lotissement', conf,
+          'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles a numeros consecutifs ' +
+          'en section ' + lotCad.section + ', contenances homogenes (moyenne ' + lotCad.moyenne + ' m2, ' +
+          'dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %). Un lot est un produit fini, dimensionne ' +
+          'pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : le cahier des charges du ' +
+          'lotissement peut interdire la division independamment du PLU, et ne figure dans aucune ' +
+          'base publique.');
+      }
       var base = c.n + ' mutations comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
                  ' a ' + Math.round(parcelle.contenance * CFG.SIM_MAX) + ' m2) dans un rayon de ' +
                  CFG.RAYON_M + ' m. ' + c.preuves + ' vente(s) de terrain a batir, ' +
-                 'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.';
+                 'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.' + noteLot;
 
       // Le cas qui vaut de l'or : gros echantillon, zero preuve.
       // L'absence de signal EST un signal.
@@ -360,7 +534,7 @@ function analyser(feature) {
   fetchParcelle(lat, lon).then(function (pc) {
     if (pc.status !== 'ok') {
       stepSet(s1, 'bad', pc.note || 'echec cadastre');
-      return finir(null, null, []);
+      return finir(null, null, [], []);
     }
     var p = pc.data;
     stepSet(s1, 'ok', p.section + '-' + p.numero + ', ' + p.contenance + ' m2, ' +
@@ -369,6 +543,7 @@ function analyser(feature) {
     var s2 = stepAdd('Zonage d\'urbanisme');
     var s3 = stepAdd('Risques');
     var s4 = stepAdd('Comparables de marche');
+    var s5 = stepAdd('Contexte parcellaire');
 
     return Promise.all([
       fetchZonage(p.geometry).then(function (z) {
@@ -397,15 +572,28 @@ function analyser(feature) {
           stepSet(s4, 'bad', d.note || 'DVF indisponible - voie 2 impossible');
         }
         return d;
+      }),
+      fetchVoisinage(lat, lon).then(function (v) {
+        if (v.status === 'ok') {
+          var lot = detecterLotissementCadastral(v.data, p);
+          stepSet(s5, lot ? 'warn' : 'ok', v.data.length + ' parcelles dans ' + CFG.LOT_RAYON_M + ' m - ' +
+            (lot ? 'LOTISSEMENT PRESUME : ' + lot.n + ' lots consecutifs section ' + lot.section +
+                   ', dispersion ' + (lot.cv * 100).toFixed(0) + ' %'
+                 : 'tissu heterogene, pas de motif de lotissement'));
+        } else {
+          stepSet(s5, 'warn', v.note || 'voisinage cadastral indisponible - discriminateur aveugle');
+        }
+        return v;
       })
     ]).then(function (res) {
-      finir(p, res[0].status === 'ok' ? res[0].data : null, (res[2] && res[2].data) || []);
+      finir(p, res[0].status === 'ok' ? res[0].data : null,
+            (res[2] && res[2].data) || [], (res[3] && res[3].data) || []);
     });
   });
 }
 
-function finir(parcelle, zonage, dvf) {
-  var v = computeParcelPotential({ parcelle: parcelle, zonage: zonage, dvf: dvf });
+function finir(parcelle, zonage, dvf, voisines) {
+  var v = computeParcelPotential({ parcelle: parcelle, zonage: zonage, dvf: dvf, voisines: voisines });
   var s = stepAdd('Verdict');
   stepSet(s, v.voie === 'aucune' ? 'warn' : 'ok',
     'voie gagnante : ' + v.voie + ' - confiance ' + v.confiance);
