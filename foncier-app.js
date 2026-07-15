@@ -588,11 +588,17 @@ function analyser(feature) {
 
     return Promise.all([
       fetchZonage(p.geometry).then(function (z) {
-        if (z.status === 'ok') {
-          stepSet(s2, 'ok', z.data.typezone + ' - ' + (z.data.libelle || '') +
-            (z.data.datappro ? ' - PLU approuve ' + z.data.datappro : ''));
-          var s2b = stepAdd('Reglement PLU');
-          fetchPLU(z.data.partition).then(function (pl) {
+        if (z.status !== 'ok') {
+          stepSet(s2, 'warn', z.note || 'commune non couverte par le GPU');
+          return z;
+        }
+        stepSet(s2, 'ok', z.data.typezone + ' - ' + (z.data.libelle || '') +
+          (z.data.datappro ? ' - PLU approuve ' + z.data.datappro : ''));
+        var s2b = stepAdd('Reglement PLU');
+        // La promesse DOIT etre retournee : sinon Promise.all n'attend pas,
+        // le rapport se dessine pendant que la requete est en vol et le
+        // voyant reste fige dans son etat initial. (Bug v0.6.)
+        return fetchPLU(z.data.partition).then(function (pl) {
             var d = pl && pl.data;
             if (pl && pl.status === 'ok' && d) {
               var opposable = d.legalStatus === 'APPROVED';
@@ -602,17 +608,17 @@ function analyser(feature) {
               UI.pluUrl = d.reglementUrl;
               UI.pluNom = d.reglement;
             } else if (pl && pl.status === 'no_reglement') {
-              stepSet(s2b, 'bad', (pl.note || '') + ' - le document existe mais ne contient pas de reglement ecrit');
+              stepSet(s2b, 'bad', (pl.note || '') + ' - aucune piece nommee reglement');
+            } else if (pl && pl.status === 'no_files') {
+              stepSet(s2b, 'warn', (pl.note || '') + ' - seule l\'archive ZIP est disponible');
+              if (d && d.archiveUrl) { UI.pluUrl = d.archiveUrl; UI.pluNom = 'archive ZIP du ' + d.type; }
             } else if (pl && d && d.rnu) {
               stepSet(s2b, 'bad', 'commune au reglement national d\'urbanisme : pas de PLU');
-            } else {
-              stepSet(s2b, 'bad', (pl && pl.note) || 'reglement introuvable');
-            }
-          });
-        } else {
-          stepSet(s2, 'warn', z.note || 'commune non couverte par le GPU');
-        }
-        return z;
+          } else {
+            stepSet(s2b, 'bad', (pl && pl.note) || 'reglement introuvable');
+          }
+          return z;
+        });
       }),
       fetchRisques(lat, lon).then(function (r) {
         stepSet(s3, r.status === 'ok' ? 'ok' : 'warn',
