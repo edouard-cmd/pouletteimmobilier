@@ -1,5 +1,5 @@
 /* ============================================================
-   foncier-app.js - v0.2
+   foncier-app.js - v0.3
    Doctrine en cascade, transposee de computeVisibilityScore_V4.
    Le moteur ne renvoie que la voie GAGNANTE (early-return), mais
    chaque adaptateur ecrit son etat dans son cache pour que les
@@ -7,19 +7,25 @@
    Ordre : vetos -> voie 1 (reglement, v1) -> voie 2 (comparables,
    mesure du reel) -> voie 3 (zonage seul, modele) -> voie 4 (abstention).
 
-   v0.2 : correction du veto qui avalait les zones AU (AUc -> charAt(0)
-   valait 'A' -> veto agricole a tort, et la branche AU de la voie 3
-   etait du code mort).
+   v0.2 : correction du veto qui avalait les zones AU.
+   v0.3 : abandon de api.cquest.org (POC communautaire, http seul,
+          dispo non garantie) au profit du DVF geolocalise officiel
+          d'Etalab, en CSV statique par commune :
+          files.data.gouv.fr/geo-dvf/latest/csv/{annee}/communes/{dep}/{insee}.csv
+          Ajout du dedoublonnage par id_mutation (une vente genere
+          plusieurs lignes : Appartement + Dependance + ...).
    ============================================================ */
 
 /* ============================================================
    1. CONFIG - LA SEULE SURFACE DE CALIBRATION
-   Tous les seuils ici, nulle part ailleurs. C'est ce bloc
-   qu'on ajuste apres la session de 30 parcelles.
+   Tous les seuils ici, nulle part ailleurs.
    ============================================================ */
 var CFG = {
+  // Millesimes disponibles dans geo-dvf/latest. A bumper aux publications.
+  ANNEES: [2021, 2022, 2023, 2024, 2025],
+
   // Ensemble comparable
-  RAYON_M: 800,              // si zonage absent, rayon geographique brut
+  RAYON_M: 800,
   SIM_MIN: 0.6,              // parcelle comparable : 0.6x a 1.6x la contenance
   SIM_MAX: 1.6,
   N_MIN_COMPARABLES: 15,     // sous ce seuil, la voie 2 ne tranche pas
@@ -36,10 +42,10 @@ var CFG = {
   FRAIS_ANS: 3,   POIDS_FRAIS: 1.0,
   MOYEN_ANS: 6,   POIDS_MOYEN: 0.6,
   POIDS_VIEUX: 0.3,
-  FENETRE_ANS: 10,           // au-dela, ignore
+  FENETRE_ANS: 10,
 
   // Vetos
-  MIN_CONTENANCE_M2: 400,    // sous ca, division non credible en v0
+  MIN_CONTENANCE_M2: 400,
   ZONES_VETO: ['A', 'N'],    // NB : AU est traite AVANT ce test, cf. moteur
 
   // Coupe-circuit PLU : preuves anterieures a la derniere revision =
@@ -58,7 +64,7 @@ var S_dvfCache = null;
    2. ADAPTATEURS
    Regle d'or : un adaptateur ne jette jamais. Il renvoie
    { status, data, note }. Une source morte allume un voyant
-   rouge, elle ne casse pas l'analyse. C'est tout le principe.
+   rouge, elle ne casse pas l'analyse.
    ============================================================ */
 
 function jget(url) {
@@ -77,7 +83,6 @@ function banAutocomplete(q) {
 }
 
 // --- Cadastre : point -> parcelle. Source : apicarto.ign.fr
-// contenance en m2, idu = identifiant unique parcelle.
 function fetchParcelle(lat, lon) {
   var geom = encodeURIComponent(JSON.stringify({ type: 'Point', coordinates: [lon, lat] }));
   return jget('https://apicarto.ign.fr/api/cadastre/parcelle?geom=' + geom)
@@ -102,8 +107,6 @@ function fetchParcelle(lat, lon) {
 }
 
 // --- GPU : zonage PLU. Source : apicarto.ign.fr/api/gpu
-// typezone : U / AUc / AUs / A / N. datappro = date d'approbation du PLU.
-// urlfic = lien vers le PDF du reglement -> la voie 1 est LA, non structuree.
 function fetchZonage(geometry) {
   var geom = encodeURIComponent(JSON.stringify(geometry));
   return jget('https://apicarto.ign.fr/api/gpu/zone-urba?geom=' + geom)
@@ -126,7 +129,6 @@ function fetchZonage(geometry) {
 }
 
 // --- Georisques. Source : georisques.gouv.fr/api/v1
-// Endpoint a verifier au premier run, l'API a bouge plusieurs fois.
 function fetchRisques(lat, lon) {
   var u = 'https://georisques.gouv.fr/api/v1/resultats_rapport_risque?latlon=' + lon + ',' + lat;
   return jget(u)
@@ -134,18 +136,111 @@ function fetchRisques(lat, lon) {
     .catch(function (e) { return (S_risquesCache = { status: 'error', note: String(e.message) }); });
 }
 
-// --- DVF : mutations autour. Source : api.cquest.org/dvf (portage Etalab)
-// Proxy v0 ASSUME : une vente de terrain a batir = marche de la division actif.
-// Ce n'est PAS "division aboutie" (qui demande de suivre les IDU dans le temps).
-// Approximation DECLAREE, affichee dans le voyant. On la raffine apres.
-function fetchDVF(lat, lon) {
-  var u = 'https://api.cquest.org/dvf?lat=' + lat + '&lon=' + lon + '&dist=' + CFG.RAYON_M;
-  return jget(u)
-    .then(function (j) {
-      var res = (j && j.resultats) || [];
-      return (S_dvfCache = { status: res.length ? 'ok' : 'no_data', data: res });
-    })
-    .catch(function (e) { return (S_dvfCache = { status: 'error', note: String(e.message), data: [] }); });
+/* ------------------------------------------------------------
+   DVF GEOLOCALISE OFFICIEL (Etalab / DGFiP)
+   Fichiers CSV statiques, un par commune et par millesime :
+   files.data.gouv.fr/geo-dvf/latest/csv/{annee}/communes/{dep}/{insee}.csv
+   Colonnes utiles verifiees sur donnees reelles :
+     id_mutation, date_mutation, nature_mutation, code_commune,
+     id_parcelle, code_type_local, type_local, code_nature_culture,
+     nature_culture, surface_terrain, longitude, latitude
+   ATTENTION : une mutation = PLUSIEURS lignes (un lot par ligne :
+   Appartement + Dependance...). Le dedoublonnage par id_mutation
+   est obligatoire, sinon on compte des lots au lieu de ventes.
+   ------------------------------------------------------------ */
+
+function depDeInsee(insee) {
+  var s = String(insee || '');
+  // DOM : 3 chiffres (971..976). Corse : 2A/2B sortent naturellement sur 2 car.
+  if (s.slice(0, 2) === '97' || s.slice(0, 2) === '98') return s.slice(0, 3);
+  return s.slice(0, 2);
+}
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  var R = 6371000, rad = Math.PI / 180;
+  var dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Parseur CSV minimal mais correct : gere les champs quotes et les
+// virgules a l'interieur des quotes (les libelles de voie en contiennent).
+function parseCSV(txt) {
+  var lignes = [], champ = '', ligne = [], q = false;
+  for (var i = 0; i < txt.length; i++) {
+    var c = txt[i];
+    if (q) {
+      if (c === '"') { if (txt[i + 1] === '"') { champ += '"'; i++; } else q = false; }
+      else champ += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { ligne.push(champ); champ = ''; }
+    else if (c === '\n') { ligne.push(champ); lignes.push(ligne); ligne = []; champ = ''; }
+    else if (c !== '\r') champ += c;
+  }
+  if (champ.length || ligne.length) { ligne.push(champ); lignes.push(ligne); }
+  if (!lignes.length) return [];
+  var head = lignes.shift();
+  return lignes.filter(function (l) { return l.length > 1; }).map(function (l) {
+    var o = {};
+    for (var k = 0; k < head.length; k++) o[head[k]] = l[k];
+    return o;
+  });
+}
+
+function fetchDVF(insee, lat, lon) {
+  var dep = depDeInsee(insee);
+  var jobs = CFG.ANNEES.map(function (an) {
+    var u = 'https://files.data.gouv.fr/geo-dvf/latest/csv/' + an +
+            '/communes/' + dep + '/' + insee + '.csv';
+    return fetch(u)
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (t) { return t ? parseCSV(t) : []; })
+      .catch(function () { return []; });   // un millesime absent n'est pas une panne
+  });
+
+  return Promise.all(jobs).then(function (parts) {
+    var lignes = [].concat.apply([], parts);
+    if (!lignes.length) {
+      return (S_dvfCache = { status: 'error', note: 'aucun fichier DVF pour ' + insee, data: [] });
+    }
+
+    // 1. Filtre geographique, 2. dedoublonnage par id_mutation.
+    var parMutation = {};
+    lignes.forEach(function (l) {
+      var la = parseFloat(l.latitude), lo = parseFloat(l.longitude);
+      if (!isFinite(la) || !isFinite(lo)) return;
+      if (haversineM(lat, lon, la, lo) > CFG.RAYON_M) return;
+
+      var id = l.id_mutation;
+      var st = Number(l.surface_terrain || 0);
+      if (!parMutation[id]) {
+        parMutation[id] = {
+          id_mutation: id,
+          date_mutation: l.date_mutation,
+          nature_mutation: l.nature_mutation,
+          id_parcelle: l.id_parcelle,
+          surface_terrain: st,
+          type_local: l.type_local || '',
+          code_nature_culture: l.code_nature_culture || ''
+        };
+      } else {
+        var m = parMutation[id];
+        // On garde la surface de terrain la plus grande de la mutation,
+        // et on retient qu'il y a du bati des qu'une ligne en porte.
+        if (st > m.surface_terrain) m.surface_terrain = st;
+        if (l.type_local) m.type_local = l.type_local;
+        if (l.code_nature_culture) m.code_nature_culture = l.code_nature_culture;
+      }
+    });
+
+    var mutations = Object.keys(parMutation).map(function (k) { return parMutation[k]; });
+    return (S_dvfCache = {
+      status: mutations.length ? 'ok' : 'no_data',
+      data: mutations,
+      note: lignes.length + ' lignes brutes -> ' + mutations.length + ' mutations dans le rayon'
+    });
+  });
 }
 
 /* ============================================================
@@ -168,14 +263,16 @@ function poidsFraicheur(annee, anneeRevisionPLU) {
   return CFG.POIDS_VIEUX;
 }
 
-// Une mutation est-elle une PREUVE de division ? Proxy v0.
-// C'EST LA LIGNE A VERIFIER EN PREMIER contre du DVF reel.
+// Une mutation est-elle une PREUVE ? Deux signaux verifies sur donnees reelles :
+//   - nature_mutation = "Vente terrain a batir"
+//   - code_nature_culture = 'AB' (nature_culture = "terrains a batir")
+// Proxy ASSUME : marche du terrain a batir actif, pas "division aboutie"
+// (qui demanderait de suivre les id_parcelle dans le temps). Chantier v1.
 function estPreuve(m) {
   var nat = String(m.nature_mutation || '').toLowerCase();
-  if (nat.indexOf('terrain a batir') >= 0 || nat.indexOf('terrain à bâtir') >= 0) return true;
-  var sansLocal = !m.type_local && !m.code_type_local;
-  var terrain = Number(m.surface_terrain || 0);
-  return sansLocal && terrain > 0;
+  if (nat.indexOf('terrain à bâtir') >= 0 || nat.indexOf('terrain a batir') >= 0) return true;
+  if (String(m.code_nature_culture || '').toUpperCase() === 'AB') return true;
+  return false;
 }
 
 function construireComparables(dvf, contenance, anneeRevisionPLU) {
@@ -234,9 +331,9 @@ function computeParcelPotential(ctx) {
     var c = construireComparables(dvf, parcelle.contenance, anneeRev);
     if (c.n >= CFG.N_MIN_COMPARABLES) {
       var conf = c.n >= CFG.N_ABSENCE_SIGNIFICATIVE ? 'haute' : 'moyenne';
-      var base = c.n + ' parcelles comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
+      var base = c.n + ' mutations comparables (' + Math.round(parcelle.contenance * CFG.SIM_MIN) +
                  ' a ' + Math.round(parcelle.contenance * CFG.SIM_MAX) + ' m2) dans un rayon de ' +
-                 CFG.RAYON_M + ' m. ' + c.preuves + ' operation(s) de terrain a batir, ' +
+                 CFG.RAYON_M + ' m. ' + c.preuves + ' vente(s) de terrain a batir, ' +
                  'taux pondere ' + (c.taux * 100).toFixed(0) + ' %.';
 
       // Le cas qui vaut de l'or : gros echantillon, zero preuve.
@@ -334,7 +431,8 @@ function analyser(feature) {
       return finir(null, null, []);
     }
     var p = pc.data;
-    stepSet(s1, 'ok', p.section + '-' + p.numero + ', ' + p.contenance + ' m2, ' + p.commune);
+    stepSet(s1, 'ok', p.section + '-' + p.numero + ', ' + p.contenance + ' m2, ' +
+      p.commune + ' (' + p.insee + ')');
 
     var s2 = stepAdd('Zonage d\'urbanisme');
     var s3 = stepAdd('Risques');
@@ -359,12 +457,12 @@ function analyser(feature) {
           r.status === 'ok' ? 'Georisques interroge' : (r.note || 'indisponible'));
         return r;
       }),
-      fetchDVF(lat, lon).then(function (d) {
+      fetchDVF(p.insee, lat, lon).then(function (d) {
         if (d.status === 'ok') {
-          stepSet(s4, 'ok', d.data.length + ' mutations dans ' + CFG.RAYON_M +
-            ' m - DVF (proxy terrain a batir)');
+          stepSet(s4, 'ok', d.note + ' - DVF geolocalise Etalab ' +
+            CFG.ANNEES[0] + '-' + CFG.ANNEES[CFG.ANNEES.length - 1]);
         } else {
-          stepSet(s4, 'bad', d.note || 'aucune mutation - voie 2 impossible');
+          stepSet(s4, 'bad', d.note || 'DVF indisponible - voie 2 impossible');
         }
         return d;
       })
