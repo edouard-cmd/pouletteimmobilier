@@ -63,7 +63,15 @@ var CFG = {
   LOT_RAYON_M: 250,          // fenetre cadastrale autour de la parcelle
   LOT_ECART_NUM: 25,         // ecart max de numero pour etre "du meme paquet"
   LOT_VOISINS_MIN: 8,        // en dessous, pas de presomption
-  LOT_CV_MAX: 0.45,          // coef. de variation des contenances (homogeneite)
+  // La bande de similarite est le coeur du detecteur : on ne demande pas
+  // "ce paquet est-il homogene ?" (deux lotissements voisins de tailles
+  // differentes le font echouer) mais "combien de parcelles RESSEMBLENT A
+  // LA MIENNE juste a cote ?". Teste sur Bernieres AH : sans la bande, le
+  // Camp de l'Ile (~670 m2) etait melange a l'operation voisine (~270 m2)
+  // -> dispersion 39 %. Avec la bande : 16 lots, dispersion 1 %.
+  LOT_SIM_MIN: 0.75,
+  LOT_SIM_MAX: 1.35,
+  LOT_CV_MAX: 0.25,          // dispersion residuelle DANS la bande
 
   // Signal B (DVF) : plusieurs ventes de terrain a batir groupees dans le
   // temps ET dans la meme section = commercialisation d'un lotissement.
@@ -318,22 +326,31 @@ function detecterLotissementCadastral(voisines, parcelle) {
   if (!voisines || !voisines.length || !parcelle) return null;
   var sec = parcelle.section;
   var num = parseInt(parcelle.numero, 10);
-  if (!sec || !isFinite(num)) return null;
+  var ref = Number(parcelle.contenance || 0);
+  if (!sec || !isFinite(num) || !ref) return null;
 
+  var lo = ref * CFG.LOT_SIM_MIN, hi = ref * CFG.LOT_SIM_MAX;
+
+  // Meme section + numero proche + contenance comparable A LA MIENNE.
+  // La bande de similarite evite de melanger deux operations mitoyennes.
   var paquet = voisines.filter(function (v) {
     var n = parseInt(v.numero, 10);
-    return v.section === sec && isFinite(n) && Math.abs(n - num) <= CFG.LOT_ECART_NUM;
+    return v.section === sec && isFinite(n) &&
+           Math.abs(n - num) <= CFG.LOT_ECART_NUM &&
+           v.contenance >= lo && v.contenance <= hi;
   });
   if (paquet.length < CFG.LOT_VOISINS_MIN) return null;
 
-  var cs = paquet.map(function (v) { return v.contenance; }).filter(function (c) { return c > 0; });
-  if (cs.length < CFG.LOT_VOISINS_MIN) return null;
-
+  var cs = paquet.map(function (v) { return v.contenance; });
   var cv = coefVariation(cs);
-  if (cv > CFG.LOT_CV_MAX) return null;   // trop heterogene : tissu ancien, pas un lotissement
+  if (cv > CFG.LOT_CV_MAX) return null;
 
   var moy = cs.reduce(function (a, b) { return a + b; }, 0) / cs.length;
-  return { n: paquet.length, cv: cv, moyenne: Math.round(moy), section: sec };
+  var nums = paquet.map(function (v) { return parseInt(v.numero, 10); }).sort(function (a, b) { return a - b; });
+  return {
+    n: paquet.length, cv: cv, moyenne: Math.round(moy), section: sec,
+    plage: nums[0] + '-' + nums[nums.length - 1]
+  };
 }
 
 /* --- SIGNAL B : DVF. Ne voit rien avant 2021, mais precis quand il voit.
@@ -430,10 +447,10 @@ function computeParcelPotential(ctx) {
       // dans aucune base publique. D'ou : presomption + renvoi au notaire.
       if (lotCad) {
         return verdict('Faible', 'lotissement', conf,
-          'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles a numeros consecutifs ' +
-          'en section ' + lotCad.section + ', contenances homogenes (moyenne ' + lotCad.moyenne + ' m2, ' +
-          'dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %). Un lot est un produit fini, dimensionne ' +
-          'pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : le cahier des charges du ' +
+          'Presomption de lot de lotissement : ' + lotCad.n + ' parcelles de taille comparable a ' +
+          'numeros consecutifs en section ' + lotCad.section + ' (' + lotCad.plage + '), moyenne ' +
+          lotCad.moyenne + ' m2, dispersion ' + (lotCad.cv * 100).toFixed(0) + ' %. Un lot est un ' +
+          'produit fini, dimensionne pour rester tel quel.' + noteLot + ' A VERIFIER CHEZ LE NOTAIRE : le cahier des charges du ' +
           'lotissement peut interdire la division independamment du PLU, et ne figure dans aucune ' +
           'base publique.');
       }
@@ -577,8 +594,8 @@ function analyser(feature) {
         if (v.status === 'ok') {
           var lot = detecterLotissementCadastral(v.data, p);
           stepSet(s5, lot ? 'warn' : 'ok', v.data.length + ' parcelles dans ' + CFG.LOT_RAYON_M + ' m - ' +
-            (lot ? 'LOTISSEMENT PRESUME : ' + lot.n + ' lots consecutifs section ' + lot.section +
-                   ', dispersion ' + (lot.cv * 100).toFixed(0) + ' %'
+            (lot ? 'LOTISSEMENT PRESUME : ' + lot.n + ' lots section ' + lot.section + ' ' + lot.plage +
+                   ', moyenne ' + lot.moyenne + ' m2, dispersion ' + (lot.cv * 100).toFixed(0) + ' %'
                  : 'tissu heterogene, pas de motif de lotissement'));
         } else {
           stepSet(s5, 'warn', v.note || 'voisinage cadastral indisponible - discriminateur aveugle');
